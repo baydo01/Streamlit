@@ -7,6 +7,7 @@ from sklearn.preprocessing import StandardScaler
 import plotly.graph_objects as go
 import warnings
 
+# Uyarıları ve hataları bastır
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="Hedge Fund: Validation + Test", layout="wide")
@@ -30,25 +31,35 @@ with st.sidebar:
 
 # --- YARDIMCI FONKSİYONLAR ---
 def get_data(ticker):
-    df = yf.download(ticker, period="2y", interval="1d", progress=False)
-    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-    df.columns = [c.lower() for c in df.columns]
-    if 'close' not in df.columns and 'adj close' in df.columns: df['close'] = df['adj close']
-    
-    df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
-    df['range'] = (df['high'] - df['low']) / df['close']
-    df['target'] = np.sign(df['close'].shift(-1) - df['close'])
-    df.dropna(inplace=True)
-    return df
+    try:
+        df = yf.download(ticker, period="2y", interval="1d", progress=False)
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        df.columns = [c.lower() for c in df.columns]
+        if 'close' not in df.columns and 'adj close' in df.columns: df['close'] = df['adj close']
+        
+        df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+        df['range'] = (df['high'] - df['low']) / df['close']
+        df['target'] = np.sign(df['close'].shift(-1) - df['close'])
+        
+        # Sonsuz veya NaN değerleri temizle
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        df.dropna(inplace=True)
+        return df
+    except Exception as e:
+        return pd.DataFrame()
 
 def train_hmm(train_data, n_states):
     """Belirli bir state sayısı ile model eğitir"""
+    if len(train_data) < 10: return None, None, None, None # Veri çok azsa uğraşma
+    
     X = train_data[['log_ret', 'range']].values
     scaler = StandardScaler()
     try:
         X_s = scaler.fit_transform(X)
-        model = GaussianHMM(n_components=n_states, covariance_type="diag", n_iter=20, random_state=42)
+        # iterasyon sayısını biraz artırdık (converge olması için)
+        model = GaussianHMM(n_components=n_states, covariance_type="diag", n_iter=100, random_state=42)
         model.fit(X_s)
+        
         means = model.means_[:, 0]
         bull = np.argmax(means)
         bear = np.argmin(means)
@@ -57,22 +68,33 @@ def train_hmm(train_data, n_states):
         return None, None, None, None
 
 def get_signal(model, scaler, bull, bear, features):
+    """
+    Modelden sinyal alır. Hata verirse 0 (Nötr) döner.
+    DÜZELTME BURADA YAPILDI.
+    """
     if model is None: return 0
-    s_feat = scaler.transform(features.reshape(1, -1))
-    probs = model.predict_proba(s_feat)[0]
-    return probs[bull] - probs[bear]
+    
+    try:
+        # Tek satırlık veri için reshape
+        s_feat = scaler.transform(features.reshape(1, -1))
+        
+        # predict_proba bazen matematiksel hata fırlatabilir (Transition matrix bozuksa)
+        probs = model.predict_proba(s_feat)[0]
+        
+        return probs[bull] - probs[bear]
+    except ValueError:
+        # "transmat_ rows must sum to 1" hatası gelirse buraya düşer
+        return 0
+    except Exception:
+        # Başka bir hata olursa
+        return 0
 
 # --- SİMÜLASYON ÇEKİRDEĞİ ---
 def run_simulation(df, start_idx, end_idx, n_states):
-    """Verilen tarih aralığında ve verilen state sayısıyla simülasyon yapar"""
-    cash = 1000 # Sanal bakiye
+    cash = 1000 
     coin = 0
     equity = []
     
-    # Basit bir backtest döngüsü (Hız için rolling window yapmıyoruz validationda, statik bakıyoruz)
-    # Validation'da modelin genel başarısına bakacağız.
-    
-    # Train kısmı: Simülasyon başlangıcından önceki veri
     train_df = df.iloc[:start_idx]
     if len(train_df) < 50: return -9999
     
@@ -80,10 +102,13 @@ def run_simulation(df, start_idx, end_idx, n_states):
     if model is None: return -9999
     
     sim_df = df.iloc[start_idx:end_idx]
-    
+    if len(sim_df) == 0: return -9999
+
     for i in range(len(sim_df)):
         row = sim_df.iloc[i]
         feat = row[['log_ret', 'range']].values
+        
+        # Hata korumalı sinyal al
         sig = get_signal(model, scaler, bull, bear, feat)
         
         price = row['close']
@@ -97,69 +122,65 @@ def run_simulation(df, start_idx, end_idx, n_states):
         equity.append(cash + (coin * price))
         
     if not equity: return -9999
-    return (equity[-1] - 1000) / 1000 # ROI
+    return (equity[-1] - 1000) / 1000 
 
 def run_full_process(ticker, t_days, v_days, cap):
     df = get_data(ticker)
-    if len(df) < (t_days + v_days + 100): return None
+    if df.empty or len(df) < (t_days + v_days + 50): return None
     
-    # Zaman Çizelgesi: [ ... TRAIN ... ] [ VALIDATION ] [ TEST ]
+    # Zaman Çizelgesi
     test_start_idx = len(df) - t_days
     val_start_idx = test_start_idx - v_days
     
-    # --- AŞAMA 1: VALIDATION (EN İYİ AYARI BUL) ---
+    if val_start_idx < 50: return None # Başlangıç için yeterli veri yoksa
+
+    # --- AŞAMA 1: VALIDATION ---
     best_n = 3
-    best_val_roi = -9999
-    
-    # Denenecek Ayarlar: State Sayısı (Karmaşıklık)
-    # 2: Boğa/Ayı
-    # 3: Boğa/Ayı/Yatay
-    # 4: Boğa/Ayı/Yatay/Panik
+    best_val_roi = -99999
     options = [2, 3, 4] 
-    
     tuning_logs = []
     
     for n in options:
-        # Validation aralığında test et
         roi = run_simulation(df, val_start_idx, test_start_idx, n)
-        tuning_logs.append(f"• Ayar {n} State -> ROI: %{roi*100:.1f}")
+        # ROI mantıklı bir aralıktaysa logla
+        if roi > -10: 
+            tuning_logs.append(f"• Ayar {n} State -> ROI: %{roi*100:.1f}")
+        else:
+             tuning_logs.append(f"• Ayar {n} State -> Hata/Yetersiz Veri")
+
         if roi > best_val_roi:
             best_val_roi = roi
             best_n = n
             
-    # --- AŞAMA 2: TEST (FİNAL KOŞU) ---
-    # Artık 'best_n' değerini biliyoruz. Test verisinde bunu kullanacağız.
-    # Test aşamasında Rolling Window (Meta-Learning) kullanalım ki en güçlü hali olsun.
-    
+    # --- AŞAMA 2: TEST (Meta-Learning) ---
     start_idx = test_start_idx
     cash = cap
     coin = 0
     equity = []
     dates = []
     
-    # Hakem listeleri
     macro_correct = [0]*5
     micro_correct = [0]*5
     
-    # Test Loop
     for i in range(start_idx, len(df)-1):
-        # Rolling Veri
+        # Güvenlik Kontrolü: index sınırları
+        if i-60 < 0: continue
+
         df_macro = df.iloc[:i]
-        df_micro = df.iloc[i-60:i] # Son 60 gün hafızası
+        df_micro = df.iloc[i-60:i] 
         
         curr = df.iloc[i]
         curr_feat = curr[['log_ret', 'range']].values
         
-        # Seçilen EN İYİ STATE SAYISI (best_n) ile modelleri eğit
-        # Macro
+        # Macro Model
         macro_m, macro_s, macro_bull, macro_bear = train_hmm(df_macro, best_n)
         macro_sig = get_signal(macro_m, macro_s, macro_bull, macro_bear, curr_feat)
         
-        # Micro
+        # Micro Model
         micro_m, micro_s, micro_bull, micro_bear = train_hmm(df_micro, best_n)
         micro_sig = get_signal(micro_m, micro_s, micro_bull, micro_bear, curr_feat)
         
-        # Meta-Learning Ağırlık
+        # Ağırlıklar
         m_score = sum(macro_correct)
         mi_score = sum(micro_correct)
         total = m_score + mi_score
@@ -182,9 +203,17 @@ def run_full_process(ticker, t_days, v_days, cap):
         
         # Skorlama
         act = curr['target']
-        macro_correct.pop(0); macro_correct.append(1 if np.sign(macro_sig)==act else 0)
-        micro_correct.pop(0); micro_correct.append(1 if np.sign(micro_sig)==act else 0)
+        # Sinyal 0 ise (Nötr/Hata) puan verme
+        if macro_sig != 0:
+            macro_correct.pop(0)
+            macro_correct.append(1 if np.sign(macro_sig)==act else 0)
         
+        if micro_sig != 0:
+            micro_correct.pop(0)
+            micro_correct.append(1 if np.sign(micro_sig)==act else 0)
+        
+    if not equity: return None
+
     final_roi = (equity[-1] - cap) / cap
     hodl_roi = (df.iloc[-1]['close'] - df.iloc[start_idx]['close']) / df.iloc[start_idx]['close']
     
@@ -203,14 +232,13 @@ def run_full_process(ticker, t_days, v_days, cap):
 if st.button("🚀 Auto-Tuner Botlarını Başlat"):
     results = []
     
-    # 2'li kolon düzeni
     cols = st.columns(2)
     
     for i, t in enumerate(tickers):
         col = cols[i % 2]
         with col:
-            st.write(f"⏳ **{t}** Analiz ediliyor (Validasyon + Test)...")
-            res = run_full_process(t, test_days, val_days, capital)
+            with st.spinner(f"⏳ **{t}** Analiz ediliyor..."):
+                res = run_full_process(t, test_days, val_days, capital)
             
             if res:
                 # KART GÖRÜNÜMÜ
@@ -240,10 +268,11 @@ if st.button("🚀 Auto-Tuner Botlarını Başlat"):
                 st.plotly_chart(fig, use_container_width=True)
                 
                 results.append(res)
+            else:
+                st.error(f"{t} için yeterli veri yok veya hesaplama yapılamadı.")
     
     if results:
         total_bal = sum([r['final_bal'] for r in results])
         total_inv = capital * len(results)
         total_roi = (total_bal - total_inv) / total_inv
         st.success(f"🏆 TOPLAM PORTFÖY SONUCU: ${total_bal:,.0f} ( ROI: %{total_roi*100:.1f} )")
-        
