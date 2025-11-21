@@ -3,276 +3,242 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from hmmlearn.hmm import GaussianHMM
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
+from statsmodels.tsa.arima.model import ARIMA
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import warnings
 
-# Uyarıları ve hataları bastır
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="Hedge Fund: Validation + Test", layout="wide")
-st.title("🔬 Auto-Tuner: Validation Destekli Otonom Fon")
+st.set_page_config(page_title="Grand Council AI", layout="wide")
+st.title("🏛️ Grand Council: HMM + ARIMA + Random Forest")
 st.markdown("""
-Bu sistem **3 Aşamalı** bir süreç izler:
-1.  **TRAIN:** Geçmiş veriyi öğrenir.
-2.  **VALIDATION (Hazırlık):** Farklı `n_components` (HMM Durum Sayısı) değerlerini test eder ve **bu coin için en iyi ayarı** bulur.
-3.  **TEST (Final):** Bulunan en iyi ayarla son dönemi simüle eder.
+Bu sistem 3 farklı yapay zeka modelini çalıştırır ve **Dinamik Ağırlıklandırma** ile en başarılı olanın sözünü dinler.
+1. **HMM:** Piyasa rejimini (Risk) koklar.
+2. **ARIMA:** Matematiksel trendi (Yönü) hesaplar.
+3. **Random Forest:** Teknik indikatörler arasındaki karmaşık ilişkileri çözer.
 """)
 
 # --- AYARLAR ---
 with st.sidebar:
-    st.header("⚙️ Ayarlar")
-    tickers = st.multiselect("Coinler", ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "AVAX-USD", "PEPE-USD"], default=["BTC-USD", "ETH-USD"])
-    capital = st.number_input("Coin Başı Sermaye ($)", value=1000)
-    
-    st.divider()
-    test_days = st.number_input("Test Süresi (Gün)", value=60, help="Final sınavı (Dokunulmaz veri)")
-    val_days = st.number_input("Validation Süresi (Gün)", value=30, help="Ayarların denendiği hazırlık dönemi")
+    st.header("⚙️ Konsey Ayarları")
+    ticker = st.selectbox("Coin", ["BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD", "XRP-USD"])
+    capital = st.number_input("Sermaye ($)", value=1000)
+    history_days = st.slider("Geriye Dönük Hafıza (Gün)", 60, 365, 180)
 
-# --- YARDIMCI FONKSİYONLAR ---
+# --- VERİ HAZIRLIĞI VE FEATURE ENGINEERING ---
 def get_data(ticker):
-    try:
-        df = yf.download(ticker, period="2y", interval="1d", progress=False)
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-        df.columns = [c.lower() for c in df.columns]
-        if 'close' not in df.columns and 'adj close' in df.columns: df['close'] = df['adj close']
-        
-        df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
-        df['range'] = (df['high'] - df['low']) / df['close']
-        df['target'] = np.sign(df['close'].shift(-1) - df['close'])
-        
-        # Sonsuz veya NaN değerleri temizle
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        df.dropna(inplace=True)
-        return df
-    except Exception as e:
-        return pd.DataFrame()
-
-def train_hmm(train_data, n_states):
-    """Belirli bir state sayısı ile model eğitir"""
-    if len(train_data) < 10: return None, None, None, None # Veri çok azsa uğraşma
+    df = yf.download(ticker, period="2y", interval="1d", progress=False)
+    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+    df.columns = [c.lower() for c in df.columns]
+    if 'close' not in df.columns and 'adj close' in df.columns: df['close'] = df['adj close']
     
-    X = train_data[['log_ret', 'range']].values
-    scaler = StandardScaler()
+    # Feature Engineering (Random Forest için)
+    df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+    df['range'] = (df['high'] - df['low']) / df['close']
+    df['rsi'] = 100 - (100 / (1 + df['close'].pct_change().rolling(14).apply(lambda x: x[x>0].mean()/abs(x[x<0].mean()) if len(x[x<0])>0 else 0)))
+    df['ma_50'] = df['close'].rolling(50).mean()
+    df['dist_ma'] = (df['close'] - df['ma_50']) / df['ma_50']
+    
+    # Target (Yarın artacak mı? 1=Evet, 0=Hayır)
+    df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
+    
+    df.fillna(method='bfill', inplace=True)
+    df.fillna(0, inplace=True)
+    return df
+
+# --- MODEL 1: HMM (Rejim Uzmanı) ---
+def get_hmm_signal(train_data, current_feat):
+    """Piyasa Boğa ise +1, Ayı ise -1"""
     try:
+        X = train_data[['log_ret', 'range']].values
+        scaler = StandardScaler()
         X_s = scaler.fit_transform(X)
-        # iterasyon sayısını biraz artırdık (converge olması için)
-        model = GaussianHMM(n_components=n_states, covariance_type="diag", n_iter=100, random_state=42)
+        model = GaussianHMM(n_components=3, covariance_type="diag", n_iter=50, random_state=42)
         model.fit(X_s)
         
         means = model.means_[:, 0]
         bull = np.argmax(means)
         bear = np.argmin(means)
-        return model, scaler, bull, bear
-    except:
-        return None, None, None, None
-
-def get_signal(model, scaler, bull, bear, features):
-    """
-    Modelden sinyal alır. Hata verirse 0 (Nötr) döner.
-    DÜZELTME BURADA YAPILDI.
-    """
-    if model is None: return 0
-    
-    try:
-        # Tek satırlık veri için reshape
-        s_feat = scaler.transform(features.reshape(1, -1))
         
-        # predict_proba bazen matematiksel hata fırlatabilir (Transition matrix bozuksa)
-        probs = model.predict_proba(s_feat)[0]
+        curr_s = scaler.transform(current_feat.reshape(1, -1))
+        probs = model.predict_proba(curr_s)[0]
         
+        # Olasılık farkı sinyali
         return probs[bull] - probs[bear]
-    except ValueError:
-        # "transmat_ rows must sum to 1" hatası gelirse buraya düşer
-        return 0
-    except Exception:
-        # Başka bir hata olursa
-        return 0
+    except: return 0
 
-# --- SİMÜLASYON ÇEKİRDEĞİ ---
-def run_simulation(df, start_idx, end_idx, n_states):
-    cash = 1000 
-    coin = 0
-    equity = []
-    
-    train_df = df.iloc[:start_idx]
-    if len(train_df) < 50: return -9999
-    
-    model, scaler, bull, bear = train_hmm(train_df, n_states)
-    if model is None: return -9999
-    
-    sim_df = df.iloc[start_idx:end_idx]
-    if len(sim_df) == 0: return -9999
+# --- MODEL 2: ARIMA (Trend Uzmanı) ---
+def get_arima_signal(history_prices):
+    """Gelecek fiyat tahmini > Şu anki fiyat ise +1"""
+    try:
+        # Hız için basit bir (5,1,0) modeli kullanıyoruz
+        # Not: Loop içinde Auto-ARIMA çok yavaş olur, sabit order kullandık.
+        model = ARIMA(history_prices, order=(5,1,0))
+        model_fit = model.fit()
+        forecast = model_fit.forecast(steps=1)
+        pred_price = forecast.iloc[0] if isinstance(forecast, pd.Series) else forecast[0]
+        
+        current_price = history_prices.iloc[-1]
+        
+        if pred_price > current_price * 1.001: return 1 # %0.1 artış bekliyorsa AL
+        elif pred_price < current_price * 0.999: return -1 # SAT
+        else: return 0
+    except: return 0
 
-    for i in range(len(sim_df)):
-        row = sim_df.iloc[i]
-        feat = row[['log_ret', 'range']].values
+# --- MODEL 3: RANDOM FOREST (Teknik İndikatör Uzmanı) ---
+def get_rf_signal(train_df, current_feat_row):
+    """Teknik verilere bakıp Yön Tahmini (Classification)"""
+    try:
+        features = ['log_ret', 'range', 'rsi', 'dist_ma']
+        X = train_df[features]
+        y = train_df['target']
         
-        # Hata korumalı sinyal al
-        sig = get_signal(model, scaler, bull, bear, feat)
+        clf = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42)
+        clf.fit(X, y)
         
-        price = row['close']
-        if sig > 0.3 and cash > 0:
-            coin = cash / price
-            cash = 0
-        elif sig < -0.3 and coin > 0:
-            cash = coin * price
-            coin = 0
+        # Tahmin (0 veya 1) -> Sinyale çevir (-1 veya 1)
+        curr_x = pd.DataFrame([current_feat_row], columns=features)
+        prediction = clf.predict(curr_x)[0] # 1 (Artış) veya 0 (Düşüş)
         
-        equity.append(cash + (coin * price))
+        prob = clf.predict_proba(curr_x)[0][1] # Artış olasılığı
         
-    if not equity: return -9999
-    return (equity[-1] - 1000) / 1000 
+        # Olasılık üzerinden güç belirle
+        return (prob - 0.5) * 2 # 0.8 olasılık -> 0.6 sinyal gücü
+    except: return 0
 
-def run_full_process(ticker, t_days, v_days, cap):
+# --- SİMÜLASYON ---
+if st.button("🏛️ Meclisi Topla ve Simüle Et"):
     df = get_data(ticker)
-    if df.empty or len(df) < (t_days + v_days + 50): return None
     
-    # Zaman Çizelgesi
-    test_start_idx = len(df) - t_days
-    val_start_idx = test_start_idx - v_days
-    
-    if val_start_idx < 50: return None # Başlangıç için yeterli veri yoksa
-
-    # --- AŞAMA 1: VALIDATION ---
-    best_n = 3
-    best_val_roi = -99999
-    options = [2, 3, 4] 
-    tuning_logs = []
-    
-    for n in options:
-        roi = run_simulation(df, val_start_idx, test_start_idx, n)
-        # ROI mantıklı bir aralıktaysa logla
-        if roi > -10: 
-            tuning_logs.append(f"• Ayar {n} State -> ROI: %{roi*100:.1f}")
-        else:
-             tuning_logs.append(f"• Ayar {n} State -> Hata/Yetersiz Veri")
-
-        if roi > best_val_roi:
-            best_val_roi = roi
-            best_n = n
+    if len(df) < history_days + 50:
+        st.error("Veri yetersiz.")
+    else:
+        start_idx = len(df) - history_days
+        
+        cash = capital
+        coin = 0
+        equity = []
+        dates = []
+        
+        # Modellerin geçmiş performans skorları (Loss based weights)
+        # Başlangıçta eşit güveniyoruz (Hata skorları eşit ve düşük)
+        errors = {'HMM': 1.0, 'ARIMA': 1.0, 'RF': 1.0} 
+        
+        weights_history = {'HMM': [], 'ARIMA': [], 'RF': []}
+        
+        progress = st.progress(0)
+        
+        # --- ROLLING WINDOW LOOP ---
+        for i in range(start_idx, len(df)-1):
+            prog = (i - start_idx) / history_days
+            progress.progress(min(prog, 1.0))
             
-    # --- AŞAMA 2: TEST (Meta-Learning) ---
-    start_idx = test_start_idx
-    cash = cap
-    coin = 0
-    equity = []
-    dates = []
-    
-    macro_correct = [0]*5
-    micro_correct = [0]*5
-    
-    for i in range(start_idx, len(df)-1):
-        # Güvenlik Kontrolü: index sınırları
-        if i-60 < 0: continue
-
-        df_macro = df.iloc[:i]
-        df_micro = df.iloc[i-60:i] 
-        
-        curr = df.iloc[i]
-        curr_feat = curr[['log_ret', 'range']].values
-        
-        # Macro Model
-        macro_m, macro_s, macro_bull, macro_bear = train_hmm(df_macro, best_n)
-        macro_sig = get_signal(macro_m, macro_s, macro_bull, macro_bear, curr_feat)
-        
-        # Micro Model
-        micro_m, micro_s, micro_bull, micro_bear = train_hmm(df_micro, best_n)
-        micro_sig = get_signal(micro_m, micro_s, micro_bull, micro_bear, curr_feat)
-        
-        # Ağırlıklar
-        m_score = sum(macro_correct)
-        mi_score = sum(micro_correct)
-        total = m_score + mi_score
-        w_macro = m_score / total if total > 0 else 0.5
-        w_micro = 1.0 - w_macro
-        
-        final_sig = (macro_sig * w_macro) + (micro_sig * w_micro)
-        
-        # İşlem
-        p = curr['close']
-        if final_sig > 0.3 and cash > 0:
-            coin = cash / p
-            cash = 0
-        elif final_sig < -0.3 and coin > 0:
-            cash = coin * p
-            coin = 0
+            # Veri Pencereleri
+            # Son 60 gün eğitim için (Modeller hafızalarını taze tutsun)
+            train_window = df.iloc[i-60:i]
+            current_row = df.iloc[i]
             
-        equity.append(cash + (coin * p))
-        dates.append(curr.name)
-        
-        # Skorlama
-        act = curr['target']
-        # Sinyal 0 ise (Nötr/Hata) puan verme
-        if macro_sig != 0:
-            macro_correct.pop(0)
-            macro_correct.append(1 if np.sign(macro_sig)==act else 0)
-        
-        if micro_sig != 0:
-            micro_correct.pop(0)
-            micro_correct.append(1 if np.sign(micro_sig)==act else 0)
-        
-    if not equity: return None
-
-    final_roi = (equity[-1] - cap) / cap
-    hodl_roi = (df.iloc[-1]['close'] - df.iloc[start_idx]['close']) / df.iloc[start_idx]['close']
-    
-    return {
-        "ticker": ticker,
-        "best_n": best_n,
-        "tuning_logs": tuning_logs,
-        "roi": final_roi,
-        "hodl": hodl_roi,
-        "equity": equity,
-        "dates": dates,
-        "final_bal": equity[-1]
-    }
-
-# --- ÇALIŞTIR ---
-if st.button("🚀 Auto-Tuner Botlarını Başlat"):
-    results = []
-    
-    cols = st.columns(2)
-    
-    for i, t in enumerate(tickers):
-        col = cols[i % 2]
-        with col:
-            with st.spinner(f"⏳ **{t}** Analiz ediliyor..."):
-                res = run_full_process(t, test_days, val_days, capital)
+            # --- 1. MODELLERİ DİNLE (Sinyal Al) ---
             
-            if res:
-                # KART GÖRÜNÜMÜ
-                bot_roi_pct = res['roi'] * 100
-                hodl_roi_pct = res['hodl'] * 100
-                alpha = bot_roi_pct - hodl_roi_pct
+            # HMM
+            hmm_sig = get_hmm_signal(train_window, current_row[['log_ret', 'range']].values)
+            
+            # ARIMA (Sadece kapanış fiyat serisini alır)
+            arima_sig = get_arima_signal(train_window['close'])
+            
+            # Random Forest
+            rf_sig = get_rf_signal(train_window, current_row[['log_ret', 'range', 'rsi', 'dist_ma']].iloc[0] if isinstance(current_row, pd.DataFrame) else current_row[['log_ret', 'range', 'rsi', 'dist_ma']])
+            
+            # --- 2. DİNAMİK AĞIRLIKLANDIRMA (MINIMUM LOSS) ---
+            # Hata ne kadar küçükse, ağırlık o kadar büyük olur (Inverse Weighting)
+            # Ağırlık = 1 / Hata_Skoru
+            inv_err_hmm = 1 / errors['HMM']
+            inv_err_arima = 1 / errors['ARIMA']
+            inv_err_rf = 1 / errors['RF']
+            
+            total_inv_err = inv_err_hmm + inv_err_arima + inv_err_rf
+            
+            w_hmm = inv_err_hmm / total_inv_err
+            w_arima = inv_err_arima / total_inv_err
+            w_rf = inv_err_rf / total_inv_err
+            
+            # Kayıt (Grafik için)
+            weights_history['HMM'].append(w_hmm)
+            weights_history['ARIMA'].append(w_arima)
+            weights_history['RF'].append(w_rf)
+            
+            # --- 3. KARAR VE İŞLEM ---
+            # Konsensüs Sinyali
+            ensemble_signal = (hmm_sig * w_hmm) + (arima_sig * w_arima) + (rf_sig * w_rf)
+            
+            price = current_row['close']
+            if ensemble_signal > 0.2 and cash > 0:
+                coin = cash / price
+                cash = 0
+            elif ensemble_signal < -0.2 and coin > 0:
+                cash = coin * price
+                coin = 0
                 
-                border_color = "#00ff00" if alpha > 0 else "#ff0000"
-                
-                st.markdown(f"""
-                <div style="border: 1px solid {border_color}; padding: 15px; border-radius: 10px; background-color: rgba(255,255,255,0.05);">
-                    <h3>{t}</h3>
-                    <small>🎯 Seçilen Ayar: <b>{res['best_n']} States (Durum)</b></small>
-                    <div style="font-size:0.8em; color:gray;">{' | '.join(res['tuning_logs'])}</div>
-                    <hr>
-                    <div style="display:flex; justify-content:space-between;">
-                        <div>Bot: <b style="color:{'#0f0' if bot_roi_pct>0 else '#f00'}">%{bot_roi_pct:.1f}</b></div>
-                        <div>HODL: <b>%{hodl_roi_pct:.1f}</b></div>
-                        <div>Alpha: <b style="color:white">%{alpha:.1f}</b></div>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                # Grafik
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=res['dates'], y=res['equity'], line=dict(color='#00ff00', width=2), name="Bot"))
-                st.plotly_chart(fig, use_container_width=True)
-                
-                results.append(res)
-            else:
-                st.error(f"{t} için yeterli veri yok veya hesaplama yapılamadı.")
-    
-    if results:
-        total_bal = sum([r['final_bal'] for r in results])
-        total_inv = capital * len(results)
-        total_roi = (total_bal - total_inv) / total_inv
-        st.success(f"🏆 TOPLAM PORTFÖY SONUCU: ${total_bal:,.0f} ( ROI: %{total_roi*100:.1f} )")
+            equity.append(cash + (coin * price))
+            dates.append(df.index[i])
+            
+            # --- 4. PERFORMANS ÖLÇÜMÜ (LOSS UPDATE) ---
+            # Yarın ne oldu?
+            actual_move = np.sign(df['close'].iloc[i+1] - price) # +1 veya -1
+            
+            # Her modelin hatasını hesapla (Decay Factor ile)
+            # Decay 0.95: Eski hataları yavaş yavaş unut, yeni hatalara odaklan.
+            decay = 0.95
+            
+            # Hata = |Tahmin - Gerçek| 
+            # Tahmin doğruysa (işaretler aynıysa) hata azdır.
+            err_h = abs(np.sign(hmm_sig) - actual_move) 
+            err_a = abs(np.sign(arima_sig) - actual_move)
+            err_r = abs(np.sign(rf_sig) - actual_move)
+            
+            # Hata skorunu güncelle (Exponential Moving Average of Errors)
+            errors['HMM'] = (errors['HMM'] * decay) + (err_h * (1-decay))
+            errors['ARIMA'] = (errors['ARIMA'] * decay) + (err_a * (1-decay))
+            errors['RF'] = (errors['RF'] * decay) + (err_r * (1-decay))
+            
+            # Sıfıra bölünme hatasını engellemek için taban koy
+            for k in errors: errors[k] = max(errors[k], 0.01)
+
+        progress.empty()
+        
+        # --- SONUÇLAR ---
+        final_roi = (equity[-1] - capital) / capital
+        hodl_roi = (df['close'].iloc[-1] - df['close'].iloc[start_idx]) / df['close'].iloc[start_idx]
+        
+        # Metrikler
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Ensemble (Meclis) Kârı", f"%{final_roi*100:.1f}", f"${equity[-1]:.0f}")
+        c2.metric("HODL", f"%{hodl_roi*100:.1f}")
+        c3.metric("Alpha", f"%{(final_roi - hodl_roi)*100:.1f}")
+        
+        # GRAFİKLER
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                            vertical_spacing=0.1, row_heights=[0.6, 0.4],
+                            subplot_titles=("Portföy Performansı", "Model Otorite Dağılımı (Kimin Sözü Geçiyor?)"))
+        
+        # 1. Equity Curve
+        fig.add_trace(go.Scatter(x=dates, y=equity, name="Ensemble Bot", line=dict(color="#00ff00")), row=1, col=1)
+        
+        # 2. Ağırlıklar (Stacked Area)
+        fig.add_trace(go.Scatter(x=dates, y=weights_history['HMM'], name="HMM (Rejim)", stackgroup='one', line=dict(width=0)), row=2, col=1)
+        fig.add_trace(go.Scatter(x=dates, y=weights_history['ARIMA'], name="ARIMA (Trend)", stackgroup='one', line=dict(width=0)), row=2, col=1)
+        fig.add_trace(go.Scatter(x=dates, y=weights_history['RF'], name="Random Forest (Teknik)", stackgroup='one', line=dict(width=0)), row=2, col=1)
+        
+        fig.update_layout(height=700, template="plotly_dark", hovermode="x unified")
+        st.plotly_chart(fig, use_container_width=True)
+        
+        st.info("""
+        ℹ️ **Grafik Analizi:**
+        Alttaki renkli grafik, "Meclis" içindeki güç dağılımını gösterir.
+        * Bir dönem **ARIMA** (Trend) alanı genişlediyse, o dönem trendler çok netti ve ARIMA haklı çıktı demektir.
+        * Piyasa karışınca **Random Forest** veya **HMM** alanı genişler.
+        * Bot, **"Dün kim haklı çıktıysa bugün parayı ona emanet et"** mantığıyla (Minimum Loss) çalışır.
+        """)
