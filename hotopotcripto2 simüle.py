@@ -9,206 +9,241 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="Hedge Fund: Meta-Learning Portfolio", layout="wide")
-st.title("🏦 Otonom Hedge Fonu: Çoklu Coin Simülasyonu")
+st.set_page_config(page_title="Hedge Fund: Validation + Test", layout="wide")
+st.title("🔬 Auto-Tuner: Validation Destekli Otonom Fon")
 st.markdown("""
-Bu modül, geliştirdiğimiz **Meta-Learning (Hakemli)** yapıyı tüm portföye uygular.
-Her coin için ayrı bir "Bot" atanır. Her bot kendi coininin karakterine göre **Macro (Geçmiş)** veya **Micro (Trend)** veriye güveneceğine kendisi karar verir.
+Bu sistem **3 Aşamalı** bir süreç izler:
+1.  **TRAIN:** Geçmiş veriyi öğrenir.
+2.  **VALIDATION (Hazırlık):** Farklı `n_components` (HMM Durum Sayısı) değerlerini test eder ve **bu coin için en iyi ayarı** bulur.
+3.  **TEST (Final):** Bulunan en iyi ayarla son dönemi simüle eder.
 """)
 
 # --- AYARLAR ---
 with st.sidebar:
-    st.header("⚙️ Fon Ayarları")
-    # Geniş Portföy
-    default_tickers = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "ADA-USD", "AVAX-USD", "DOGE-USD"]
-    selected_tickers = st.multiselect("Portföydeki Coinler", default_tickers, default=["BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD"])
-    
-    capital_per_coin = st.number_input("Coin Başına Sermaye ($)", value=1000)
-    test_days = st.number_input("Test Süresi (Gün)", value=90)
+    st.header("⚙️ Ayarlar")
+    tickers = st.multiselect("Coinler", ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "AVAX-USD", "PEPE-USD"], default=["BTC-USD", "ETH-USD"])
+    capital = st.number_input("Coin Başı Sermaye ($)", value=1000)
     
     st.divider()
-    st.info("Botlar şu an hesaplama yapıyor... Bu işlem biraz zaman alabilir.")
+    test_days = st.number_input("Test Süresi (Gün)", value=60, help="Final sınavı (Dokunulmaz veri)")
+    val_days = st.number_input("Validation Süresi (Gün)", value=30, help="Ayarların denendiği hazırlık dönemi")
 
-# --- CORE MOTOR (TEK COIN İÇİN) ---
-def train_predict_hmm(train_data, current_features):
-    """HMM Modeli eğit ve o anlık sinyal üret"""
-    if len(train_data) < 30: return 0
-    
-    X = train_data[['log_ret', 'range']].values
-    scaler = StandardScaler()
-    try:
-        X_s = scaler.fit_transform(X)
-        # Hız optimizasyonu: iterasyon 15, diag kovaryans
-        model = GaussianHMM(n_components=3, covariance_type="diag", n_iter=15, random_state=42)
-        model.fit(X_s)
-        
-        means = model.means_[:, 0]
-        bull = np.argmax(means)
-        bear = np.argmin(means)
-        
-        curr_s = scaler.transform(current_features.reshape(1, -1))
-        probs = model.predict_proba(curr_s)[0]
-        
-        return probs[bull] - probs[bear]
-    except:
-        return 0
-
-def run_meta_simulation(ticker, days, cap):
-    # Veri İndir
+# --- YARDIMCI FONKSİYONLAR ---
+def get_data(ticker):
     df = yf.download(ticker, period="2y", interval="1d", progress=False)
     if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
     df.columns = [c.lower() for c in df.columns]
     if 'close' not in df.columns and 'adj close' in df.columns: df['close'] = df['adj close']
     
-    # Feature Engineering
     df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
     df['range'] = (df['high'] - df['low']) / df['close']
-    df['target'] = np.sign(df['close'].shift(-1) - df['close']) # Başarı ölçümü için
+    df['target'] = np.sign(df['close'].shift(-1) - df['close'])
     df.dropna(inplace=True)
-    
-    if len(df) < days + 60: return None
-    
-    start_idx = len(df) - days
-    cash = cap
+    return df
+
+def train_hmm(train_data, n_states):
+    """Belirli bir state sayısı ile model eğitir"""
+    X = train_data[['log_ret', 'range']].values
+    scaler = StandardScaler()
+    try:
+        X_s = scaler.fit_transform(X)
+        model = GaussianHMM(n_components=n_states, covariance_type="diag", n_iter=20, random_state=42)
+        model.fit(X_s)
+        means = model.means_[:, 0]
+        bull = np.argmax(means)
+        bear = np.argmin(means)
+        return model, scaler, bull, bear
+    except:
+        return None, None, None, None
+
+def get_signal(model, scaler, bull, bear, features):
+    if model is None: return 0
+    s_feat = scaler.transform(features.reshape(1, -1))
+    probs = model.predict_proba(s_feat)[0]
+    return probs[bull] - probs[bear]
+
+# --- SİMÜLASYON ÇEKİRDEĞİ ---
+def run_simulation(df, start_idx, end_idx, n_states):
+    """Verilen tarih aralığında ve verilen state sayısıyla simülasyon yapar"""
+    cash = 1000 # Sanal bakiye
     coin = 0
     equity = []
     
-    # Hakem Hafızası
-    macro_correctness = [0] * 10
-    micro_correctness = [0] * 10
+    # Basit bir backtest döngüsü (Hız için rolling window yapmıyoruz validationda, statik bakıyoruz)
+    # Validation'da modelin genel başarısına bakacağız.
     
-    # Simülasyon Loop
-    for i in range(start_idx, len(df)-1):
-        # Veri Dilimleri
-        df_macro = df.iloc[:i]      # Tüm geçmiş
-        df_micro = df.iloc[i-60:i]  # Son 2 ay
+    # Train kısmı: Simülasyon başlangıcından önceki veri
+    train_df = df.iloc[:start_idx]
+    if len(train_df) < 50: return -9999
+    
+    model, scaler, bull, bear = train_hmm(train_df, n_states)
+    if model is None: return -9999
+    
+    sim_df = df.iloc[start_idx:end_idx]
+    
+    for i in range(len(sim_df)):
+        row = sim_df.iloc[i]
+        feat = row[['log_ret', 'range']].values
+        sig = get_signal(model, scaler, bull, bear, feat)
         
-        curr_feat = df.iloc[i][['log_ret', 'range']].values
-        
-        # Tahminler
-        macro_sig = train_predict_hmm(df_macro, curr_feat)
-        micro_sig = train_predict_hmm(df_micro, curr_feat)
-        
-        # Hakem Kararı (Ağırlık)
-        m_perf = sum(macro_correctness)
-        mi_perf = sum(micro_correctness)
-        total = m_perf + mi_perf
-        w_macro = m_perf / total if total > 0 else 0.5
-        w_micro = 1.0 - w_macro
-        
-        # Sinyal Birleştirme
-        final_signal = (macro_sig * w_macro) + (micro_sig * w_micro)
-        
-        # İşlem
-        price = df.iloc[i]['close']
-        if final_signal > 0.25 and cash > 0:
+        price = row['close']
+        if sig > 0.3 and cash > 0:
             coin = cash / price
             cash = 0
-        elif final_signal < -0.25 and coin > 0:
+        elif sig < -0.3 and coin > 0:
             cash = coin * price
             coin = 0
-            
+        
         equity.append(cash + (coin * price))
         
-        # Öğrenme (Puanlama)
-        actual = df.iloc[i]['target']
-        macro_correctness.pop(0)
-        macro_correctness.append(1 if np.sign(macro_sig) == actual else 0)
-        micro_correctness.pop(0)
-        micro_correctness.append(1 if np.sign(micro_sig) == actual else 0)
+    if not equity: return -9999
+    return (equity[-1] - 1000) / 1000 # ROI
 
-    # Sonuç Hesaplama
-    final_val = equity[-1]
-    roi = (final_val - cap) / cap
+def run_full_process(ticker, t_days, v_days, cap):
+    df = get_data(ticker)
+    if len(df) < (t_days + v_days + 100): return None
+    
+    # Zaman Çizelgesi: [ ... TRAIN ... ] [ VALIDATION ] [ TEST ]
+    test_start_idx = len(df) - t_days
+    val_start_idx = test_start_idx - v_days
+    
+    # --- AŞAMA 1: VALIDATION (EN İYİ AYARI BUL) ---
+    best_n = 3
+    best_val_roi = -9999
+    
+    # Denenecek Ayarlar: State Sayısı (Karmaşıklık)
+    # 2: Boğa/Ayı
+    # 3: Boğa/Ayı/Yatay
+    # 4: Boğa/Ayı/Yatay/Panik
+    options = [2, 3, 4] 
+    
+    tuning_logs = []
+    
+    for n in options:
+        # Validation aralığında test et
+        roi = run_simulation(df, val_start_idx, test_start_idx, n)
+        tuning_logs.append(f"• Ayar {n} State -> ROI: %{roi*100:.1f}")
+        if roi > best_val_roi:
+            best_val_roi = roi
+            best_n = n
+            
+    # --- AŞAMA 2: TEST (FİNAL KOŞU) ---
+    # Artık 'best_n' değerini biliyoruz. Test verisinde bunu kullanacağız.
+    # Test aşamasında Rolling Window (Meta-Learning) kullanalım ki en güçlü hali olsun.
+    
+    start_idx = test_start_idx
+    cash = cap
+    coin = 0
+    equity = []
+    dates = []
+    
+    # Hakem listeleri
+    macro_correct = [0]*5
+    micro_correct = [0]*5
+    
+    # Test Loop
+    for i in range(start_idx, len(df)-1):
+        # Rolling Veri
+        df_macro = df.iloc[:i]
+        df_micro = df.iloc[i-60:i] # Son 60 gün hafızası
+        
+        curr = df.iloc[i]
+        curr_feat = curr[['log_ret', 'range']].values
+        
+        # Seçilen EN İYİ STATE SAYISI (best_n) ile modelleri eğit
+        # Macro
+        macro_m, macro_s, macro_bull, macro_bear = train_hmm(df_macro, best_n)
+        macro_sig = get_signal(macro_m, macro_s, macro_bull, macro_bear, curr_feat)
+        
+        # Micro
+        micro_m, micro_s, micro_bull, micro_bear = train_hmm(df_micro, best_n)
+        micro_sig = get_signal(micro_m, micro_s, micro_bull, micro_bear, curr_feat)
+        
+        # Meta-Learning Ağırlık
+        m_score = sum(macro_correct)
+        mi_score = sum(micro_correct)
+        total = m_score + mi_score
+        w_macro = m_score / total if total > 0 else 0.5
+        w_micro = 1.0 - w_macro
+        
+        final_sig = (macro_sig * w_macro) + (micro_sig * w_micro)
+        
+        # İşlem
+        p = curr['close']
+        if final_sig > 0.3 and cash > 0:
+            coin = cash / p
+            cash = 0
+        elif final_sig < -0.3 and coin > 0:
+            cash = coin * p
+            coin = 0
+            
+        equity.append(cash + (coin * p))
+        dates.append(curr.name)
+        
+        # Skorlama
+        act = curr['target']
+        macro_correct.pop(0); macro_correct.append(1 if np.sign(macro_sig)==act else 0)
+        micro_correct.pop(0); micro_correct.append(1 if np.sign(micro_sig)==act else 0)
+        
+    final_roi = (equity[-1] - cap) / cap
     hodl_roi = (df.iloc[-1]['close'] - df.iloc[start_idx]['close']) / df.iloc[start_idx]['close']
     
     return {
         "ticker": ticker,
-        "final_balance": final_val,
-        "roi": roi,
-        "hodl_roi": hodl_roi,
-        "equity_curve": equity
+        "best_n": best_n,
+        "tuning_logs": tuning_logs,
+        "roi": final_roi,
+        "hodl": hodl_roi,
+        "equity": equity,
+        "dates": dates,
+        "final_bal": equity[-1]
     }
 
-# --- ÇALIŞTIRMA BUTONU ---
-if st.button("🚀 FONU BAŞLAT (Tüm Botları Çalıştır)", type="primary"):
-    if not selected_tickers:
-        st.error("Lütfen coin seçin.")
-    else:
-        results = []
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        # Portföy Döngüsü
-        for idx, t in enumerate(selected_tickers):
-            status_text.text(f"Bot çalışıyor: {t} (%{int((idx/len(selected_tickers))*100)})")
-            res = run_meta_simulation(t, test_days, capital_per_coin)
+# --- ÇALIŞTIR ---
+if st.button("🚀 Auto-Tuner Botlarını Başlat"):
+    results = []
+    
+    # 2'li kolon düzeni
+    cols = st.columns(2)
+    
+    for i, t in enumerate(tickers):
+        col = cols[i % 2]
+        with col:
+            st.write(f"⏳ **{t}** Analiz ediliyor (Validasyon + Test)...")
+            res = run_full_process(t, test_days, val_days, capital)
+            
             if res:
-                results.append(res)
-            progress_bar.progress((idx + 1) / len(selected_tickers))
-            
-        status_text.empty()
-        progress_bar.empty()
-        
-        if results:
-            # --- TOPLAM PORTFÖY ANALİZİ ---
-            total_invested = capital_per_coin * len(results)
-            total_final = sum([r['final_balance'] for r in results])
-            total_roi = (total_final - total_invested) / total_invested
-            
-            # HODL Toplamı
-            # Her coinin hodl getirisini sermaye ile çarpıp toplayalım
-            total_hodl_balance = sum([capital_per_coin * (1 + r['hodl_roi']) for r in results])
-            total_hodl_roi = (total_hodl_balance - total_invested) / total_invested
-            
-            # ALPHA
-            alpha = total_roi - total_hodl_roi
-            
-            st.success("✅ Simülasyon Tamamlandı!")
-            
-            # 1. BÜYÜK ÖZET (SCOREBOARD)
-            k1, k2, k3 = st.columns(3)
-            k1.metric("FON TOPLAM DEĞERİ", f"${total_final:,.0f}", f"%{total_roi*100:.1f} (Net Kâr)")
-            k2.metric("Piyasa (HODL) Değeri", f"${total_hodl_balance:,.0f}", f"%{total_hodl_roi*100:.1f}")
-            k3.metric("FON ALPHA (FARK)", f"${total_final - total_hodl_balance:,.0f}", f"%{alpha*100:.1f}", delta_color="normal")
-            
-            st.markdown("---")
-            
-            # 2. DETAYLI TABLO
-            summary_data = []
-            for r in results:
-                summary_data.append({
-                    "Coin": r['ticker'],
-                    "Bot Kârı (%)": f"%{r['roi']*100:.1f}",
-                    "HODL (%)": f"%{r['hodl_roi']*100:.1f}",
-                    "Alpha (Fark)": f"%{(r['roi'] - r['hodl_roi'])*100:.1f}",
-                    "Son Bakiye": f"${r['final_balance']:.0f}"
-                })
-            st.dataframe(pd.DataFrame(summary_data))
-            
-            # 3. KÜMÜLATİF GRAFİK
-            # Tüm coinlerin equity eğrilerini toplayarak Fon Grafiği çiz
-            # (Basitlik için sadece toplamı değil, her coini ayrı çizelim karışmasın)
-            
-            fig = go.Figure()
-            
-            # Ana Fon Eğrisi (Yaklaşık birleştirme - uzunluklar eşitse)
-            min_len = min([len(r['equity_curve']) for r in results])
-            total_equity_curve = np.zeros(min_len)
-            
-            for r in results:
-                # Son 'min_len' kadarını al
-                curve = np.array(r['equity_curve'][-min_len:])
-                total_equity_curve += curve
+                # KART GÖRÜNÜMÜ
+                bot_roi_pct = res['roi'] * 100
+                hodl_roi_pct = res['hodl'] * 100
+                alpha = bot_roi_pct - hodl_roi_pct
                 
-                # Bireysel Çizgiler (Opak)
-                fig.add_trace(go.Scatter(y=curve, name=r['ticker'], opacity=0.3, line=dict(width=1)))
-
-            # Toplam Fon Çizgisi (Kalın)
-            fig.add_trace(go.Scatter(y=total_equity_curve, name="TOPLAM FON", line=dict(color="#00ff00", width=4)))
-            
-            fig.update_layout(title="Fon Büyümesi vs Bireysel Coinler", template="plotly_dark", height=500)
-            st.plotly_chart(fig, use_container_width=True)
-            
-        else:
-            st.error("Hiçbir coin için sonuç üretilemedi.")
+                border_color = "#00ff00" if alpha > 0 else "#ff0000"
+                
+                st.markdown(f"""
+                <div style="border: 1px solid {border_color}; padding: 15px; border-radius: 10px; background-color: rgba(255,255,255,0.05);">
+                    <h3>{t}</h3>
+                    <small>🎯 Seçilen Ayar: <b>{res['best_n']} States (Durum)</b></small>
+                    <div style="font-size:0.8em; color:gray;">{' | '.join(res['tuning_logs'])}</div>
+                    <hr>
+                    <div style="display:flex; justify-content:space-between;">
+                        <div>Bot: <b style="color:{'#0f0' if bot_roi_pct>0 else '#f00'}">%{bot_roi_pct:.1f}</b></div>
+                        <div>HODL: <b>%{hodl_roi_pct:.1f}</b></div>
+                        <div>Alpha: <b style="color:white">%{alpha:.1f}</b></div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Grafik
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=res['dates'], y=res['equity'], line=dict(color='#00ff00', width=2), name="Bot"))
+                st.plotly_chart(fig, use_container_width=True)
+                
+                results.append(res)
+    
+    if results:
+        total_bal = sum([r['final_bal'] for r in results])
+        total_inv = capital * len(results)
+        total_roi = (total_bal - total_inv) / total_inv
+        st.success(f"🏆 TOPLAM PORTFÖY SONUCU: ${total_bal:,.0f} ( ROI: %{total_roi*100:.1f} )")
+        
