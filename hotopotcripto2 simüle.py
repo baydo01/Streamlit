@@ -1,3 +1,6 @@
+# kalman_ai_trader_full.py
+# Geliştirilmiş Kalman AI Trader — Minimal Hız Opt. + Tüm Coinler + Otomatik Günlük Veri
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -8,20 +11,20 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 import xgboost as xgb
 import plotly.graph_objects as go
-import warnings
 import time
+import warnings
 from deap import base, creator, tools, algorithms
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="Kalman AI Trader - Full", layout="wide")
-st.title("Kalman AI Trader — Full Enhanced")
+st.set_page_config(page_title="Kalman AI Trader - Full Enhanced", layout="wide")
+st.title("Kalman AI Trader — Full Enhanced (Minimal Hız Opt.)")
 
 # -------------------- AYARLAR --------------------
 with st.sidebar:
     st.header("⚙️ Ayarlar")
-    default_tickers = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "AVAX-USD", "DOGE-USD"]
-    selected_tickers = st.multiselect("Sepet", default_tickers, default=default_tickers)
+    default_tickers = ["BTC-USD","ETH-USD","SOL-USD","BNB-USD","XRP-USD","AVAX-USD","DOGE-USD","LTC-USD","ADA-USD","MATIC-USD"]
+    selected_tickers = st.multiselect("Sepet (Tüm coinleri seçebilirsiniz)", default_tickers, default=default_tickers)
     capital = st.number_input("Coin Başı Başlangıç ($)", value=10.0)
     window_size = st.slider("Öğrenme Penceresi (Bar Sayısı)", 20, 60, 30)
     use_ga = st.checkbox("Genetic Algoritma ile parametre optimizasyonu (Ağır)", value=False)
@@ -30,13 +33,14 @@ with st.sidebar:
 # -------------------- KALMAN FİLTRESİ --------------------
 def apply_kalman_filter(prices):
     n_iter = len(prices)
-    xhat = np.zeros(n_iter)
-    P = np.zeros(n_iter)
-    xhatminus = np.zeros(n_iter)
-    Pminus = np.zeros(n_iter)
-    K = np.zeros(n_iter)
+    sz = (n_iter,)
     Q = 1e-5
     R = 0.01 ** 2
+    xhat = np.zeros(sz)
+    P = np.zeros(sz)
+    xhatminus = np.zeros(sz)
+    Pminus = np.zeros(sz)
+    K = np.zeros(sz)
     xhat[0] = prices.iloc[0]
     P[0] = 1.0
     for k in range(1, n_iter):
@@ -60,188 +64,254 @@ def get_raw_data(ticker):
     except Exception:
         return None
 
-# 5-period moving average + ma5_score
 def add_ma5_and_score(df, timeframe_code):
     df['ma5'] = df['close'].rolling(window=5).mean()
-    long_w = {'D':252,'W':52,'M':36}[timeframe_code]
+    if timeframe_code == 'D':
+        long_w = 252
+    elif timeframe_code == 'W':
+        long_w = 52
+    else:
+        long_w = 36
     df['ma5_long_mean'] = df['ma5'].rolling(window=long_w, min_periods=10).mean()
     df['ma5_long_std'] = df['ma5'].rolling(window=long_w, min_periods=10).std()
     df['ma5_score'] = (df['ma5'] - df['ma5_long_mean']) / (df['ma5_long_std'] + 1e-9)
     df['ma5_score'].fillna(0, inplace=True)
     return df
 
-# -------------------- VERİ İŞLEME --------------------
 def process_data(df, timeframe):
     if df is None or len(df) < 100:
         return None
     agg_dict = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
-    if timeframe == 'W': df_res = df.resample('W').agg(agg_dict).dropna()
-    elif timeframe == 'M': df_res = df.resample('ME').agg(agg_dict).dropna()
-    else: df_res = df.copy()
-    if len(df_res) < 50: return None
+    if timeframe == 'W':
+        df_res = df.resample('W').agg(agg_dict).dropna()
+    elif timeframe == 'M':
+        df_res = df.resample('ME').agg(agg_dict).dropna()
+    else:
+        df_res = df.copy()
+    if len(df_res) < 50:
+        return None
     df_res['kalman_close'] = apply_kalman_filter(df_res['close'])
-    df_res['log_ret'] = np.log(df_res['kalman_close'] / df_res['kalman_close'].shift(1))
-    df_res['range'] = (df_res['high'] - df_res['low']) / df_res['close']
+    df_res['log_ret'] = np.log(df_res['kalman_close']/df_res['kalman_close'].shift(1))
+    df_res['range'] = (df_res['high'] - df_res['low'])/df_res['close']
     df_res['trend_signal'] = np.where(df_res['close'] > df_res['kalman_close'], 1, -1)
     df_res['target'] = (df_res['close'].shift(-1) > df_res['close']).astype(int)
     df_res.dropna(inplace=True)
     df_res = add_ma5_and_score(df_res, timeframe)
-    df_res.replace([np.inf,-np.inf], np.nan, inplace=True)
+    df_res.replace([np.inf, -np.inf], np.nan, inplace=True)
     df_res.dropna(inplace=True)
     return df_res
 
 # -------------------- WALK-FORWARD --------------------
 def walk_forward_splits(df, n_splits=3, test_size_ratio=0.2):
     n = len(df)
-    test_size = max(int(n*test_size_ratio),10)
-    step = max(int((n-test_size)/(n_splits+1)),1)
-    splits=[]
+    test_size = max(int(n * test_size_ratio), 10)
+    step = max(int((n - test_size) / (n_splits + 1)), 1)
+    splits = []
     for i in range(n_splits):
-        train_end=step*(i+1)
-        val_start=train_end
-        val_end=val_start+step
-        test_start=val_end
-        test_end=min(test_start+test_size,n)
-        if test_end-test_start<5: break
-        splits.append((slice(0,train_end),slice(val_start,val_end),slice(test_start,test_end)))
+        train_end = step * (i + 1)
+        val_start = train_end
+        val_end = val_start + step
+        test_start = val_end
+        test_end = min(test_start + test_size, n)
+        if test_end - test_start < 5:
+            break
+        splits.append((slice(0, train_end), slice(val_start, val_end), slice(test_start, test_end)))
     if not splits:
-        train_end=int(n*0.6); val_end=int(n*0.8)
-        splits=[(slice(0,train_end),slice(train_end,val_end),slice(val_end,n))]
+        train_end = int(n * 0.6)
+        val_end = int(n * 0.8)
+        splits = [(slice(0, train_end), slice(train_end, val_end), slice(val_end, n))]
     return splits
 
 # -------------------- MODEL EĞİTİM --------------------
 def train_models_for_window(train_df, rf_depth=5, xgb_params=None, n_hmm=3):
-    features=['log_ret','range','trend_signal','ma5_score']
-    X=train_df[features]; y=train_df['target']
-    scaler=StandardScaler(); X_s=scaler.fit_transform(X)
-    clf_rf=RandomForestClassifier(n_estimators=30,max_depth=rf_depth,n_jobs=-1,random_state=42); clf_rf.fit(X,y)
-    if xgb_params is None: xgb_params={'n_estimators':30,'max_depth':3,'learning_rate':0.1,'tree_method':'hist','n_jobs':-1}
-    clf_xgb=xgb.XGBClassifier(use_label_encoder=False,eval_metric='logloss',**xgb_params); clf_xgb.fit(X,y)
+    features = ['log_ret','range','trend_signal','ma5_score']
+    X = train_df[features]
+    y = train_df['target']
+    scaler = StandardScaler()
+    X_s = scaler.fit_transform(X)
+    
+    clf_rf = RandomForestClassifier(n_estimators=30, max_depth=rf_depth, n_jobs=-1, random_state=42)
+    clf_rf.fit(X, y)
+    
+    if xgb_params is None:
+        xgb_params = {'n_estimators':30, 'max_depth':3, 'learning_rate':0.1,'tree_method':'hist','n_jobs':-1}
+    clf_xgb = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', **xgb_params)
+    clf_xgb.fit(X, y)
+    
     try:
-        meta_X=np.vstack([clf_rf.predict_proba(X)[:,1], clf_xgb.predict_proba(X)[:,1]]).T
-        meta_clf=LogisticRegression(max_iter=200); meta_clf.fit(meta_X,y)
-    except: meta_clf=None
-    hmm_model=None
+        meta_X = np.vstack([clf_rf.predict_proba(X)[:,1], clf_xgb.predict_proba(X)[:,1]]).T
+        meta_clf = LogisticRegression(max_iter=200)
+        meta_clf.fit(meta_X, y)
+    except Exception:
+        meta_clf = None
+    
+    hmm_model = None
     try:
-        X_hmm=train_df[['log_ret','range']].values; Xh_s=StandardScaler().fit_transform(X_hmm)
-        hmm_model=GaussianHMM(n_components=n_hmm,covariance_type='diag',n_iter=50,random_state=42); hmm_model.fit(Xh_s)
-    except: hmm_model=None
-    return {'rf':clf_rf,'xgb':clf_xgb,'meta':meta_clf,'scaler':scaler,'hmm':hmm_model}
+        X_hmm = train_df[['log_ret','range']].values
+        scaler_hmm = StandardScaler()
+        Xh_s = scaler_hmm.fit_transform(X_hmm)
+        hmm_model = GaussianHMM(n_components=n_hmm, covariance_type='diag', n_iter=50, random_state=42)
+        hmm_model.fit(Xh_s)
+    except Exception:
+        hmm_model = None
+    
+    return {'rf': clf_rf, 'xgb': clf_xgb, 'meta': meta_clf, 'scaler': scaler, 'hmm': hmm_model}
 
-def predict_with_models(models,row):
-    rf_prob=xgb_prob=0.5; stack_sig=hmm_sig=0.0
+def predict_with_models(models, row):
+    rf_prob = xgb_prob = 0.5
+    stack_sig = hmm_sig = 0.0
     try:
-        features=['log_ret','range','trend_signal','ma5_score']
-        Xrow=row[features].values.reshape(1,-1)
-        rf_prob=models['rf'].predict_proba(pd.DataFrame(Xrow,columns=features))[0][1]
-    except: rf_prob=0.5
-    try: xgb_prob=models['xgb'].predict_proba(pd.DataFrame(Xrow,columns=features))[0][1]
-    except: xgb_prob=0.5
+        features = ['log_ret','range','trend_signal','ma5_score']
+        Xrow = row[features].values.reshape(1,-1)
+        rf_prob = models['rf'].predict_proba(pd.DataFrame(Xrow, columns=features))[0][1]
+        xgb_prob = models['xgb'].predict_proba(pd.DataFrame(Xrow, columns=features))[0][1]
+    except Exception:
+        pass
     try:
         if models['meta'] is not None:
-            stack_prob=models['meta'].predict_proba(np.array([[rf_prob,xgb_prob]]))[0][1]
-            stack_sig=(stack_prob-0.5)*2
-        else: stack_sig=((rf_prob+xgb_prob)/2-0.5)*2
-    except: stack_sig=((rf_prob+xgb_prob)/2-0.5)*2
+            stack_prob = models['meta'].predict_proba(np.array([[rf_prob,xgb_prob]]))[0][1]
+            stack_sig = (stack_prob-0.5)*2
+        else:
+            stack_sig = ((rf_prob+xgb_prob)/2-0.5)*2
+    except Exception:
+        stack_sig = ((rf_prob+xgb_prob)/2-0.5)*2
     try:
         if models['hmm'] is not None:
-            Xh=row[['log_ret','range']].values.reshape(1,-1)
-            probs=models['hmm'].predict_proba(StandardScaler().fit_transform(Xh))[0]
-            bull=np.argmax(models['hmm'].means_[:,0]); bear=np.argmin(models['hmm'].means_[:,0])
-            hmm_sig=probs[bull]-probs[bear]
-    except: hmm_sig=0.0
-    k_trend=row['trend_signal']
-    combined=(hmm_sig*0.25)+(stack_sig*0.35)+(k_trend*0.4)
+            Xh = row[['log_ret','range']].values.reshape(1,-1)
+            probs = models['hmm'].predict_proba(StandardScaler().fit_transform(Xh))[0]
+            bull = np.argmax(models['hmm'].means_[:,0])
+            bear = np.argmin(models['hmm'].means_[:,0])
+            hmm_sig = probs[bull]-probs[bear]
+    except Exception:
+        hmm_sig = 0.0
+    k_trend = row['trend_signal']
+    combined = hmm_sig*0.25 + stack_sig*0.35 + k_trend*0.4
     return combined
 
-# -------------------- SIMÜLASYON --------------------
-def simulate_walk_forward(df,start_cap,win_size,params=None):
+def simulate_walk_forward(df, start_cap, win_size, params=None):
     if params is None: params={}
-    rf_depth=params.get('rf_depth',5); xgb_params=params.get('xgb_params',None)
-    buy_t=params.get('buy_th',0.25); sell_t=params.get('sell_th',-0.25)
-    splits=walk_forward_splits(df,n_splits=3)
-    equity=[]; dates=[]; cash=start_cap; coin=0
+    rf_depth = params.get('rf_depth',5)
+    xgb_params = params.get('xgb_params',None)
+    buy_t = params.get('buy_th',0.25)
+    sell_t = params.get('sell_th',-0.25)
+    
+    splits = walk_forward_splits(df, n_splits=3)
+    equity, dates = [], []
+    cash = start_cap
+    coin = 0
     for tr,val,tst in splits:
-        train_slice=slice(0,val.stop); test_slice=tst
-        train_df=df.iloc[train_slice]; test_df=df.iloc[test_slice]
+        train_slice = slice(0,val.stop)
+        test_slice = tst
+        train_df = df.iloc[train_slice]
+        test_df = df.iloc[test_slice]
         if len(test_df)==0: continue
-        models=train_models_for_window(train_df,rf_depth=rf_depth,xgb_params=xgb_params)
+        models = train_models_for_window(train_df, rf_depth=rf_depth, xgb_params=xgb_params)
         for idx in test_df.index:
-            row=df.loc[idx]; sig=predict_with_models(models,row); price=row['close']
-            if sig>buy_t and cash>0: coin=cash/price; cash=0
-            elif sig<sell_t and coin>0: cash=coin*price; coin=0
-            equity.append(cash+coin*price); dates.append(idx)
+            row = df.loc[idx]
+            sig = predict_with_models(models,row)
+            price = row['close']
+            if sig>buy_t and cash>0:
+                coin = cash/price
+                cash = 0
+            elif sig<sell_t and coin>0:
+                cash = coin*price
+                coin=0
+            equity.append(cash+coin*price)
+            dates.append(idx)
     if len(equity)==0:
         for i in range(len(df)):
-            sig=df['trend_signal'].iloc[i]; price=df['close'].iloc[i]
-            if sig>0 and cash>0: coin=cash/price; cash=0
-            elif sig<0 and coin>0: cash=coin*price; coin=0
-            equity.append(cash+coin*price); dates.append(df.index[i])
-    final=equity[-1]; roi=(final-start_cap)/start_cap
+            sig = df['trend_signal'].iloc[i]
+            price = df['close'].iloc[i]
+            if sig>0 and cash>0:
+                coin=cash/price
+                cash=0
+            elif sig<0 and coin>0:
+                cash=coin*price
+                coin=0
+            equity.append(cash+coin*price)
+            dates.append(df.index[i])
+    final = equity[-1]
+    roi = (final-start_cap)/start_cap
     return {'final':final,'roi':roi,'equity':equity,'dates':dates}
 
-# -------------------- GA --------------------
-def ga_optimize_params_light(df,start_cap,win_size,n_gen=8,pop_size=10):
-    creator.create('FitnessMax',base.Fitness,weights=(1.0,))
-    creator.create('Individual',list,fitness=creator.FitnessMax)
-    toolbox=base.Toolbox()
-    toolbox.register('rf_depth',np.random.randint,3,13)
-    toolbox.register('xgb_max_depth',np.random.randint,2,7)
-    toolbox.register('xgb_eta',np.random.uniform,0.01,0.3)
-    toolbox.register('buy_th',np.random.uniform,0.05,0.5)
-    toolbox.register('sell_th',np.random.uniform,-0.5,-0.05)
-    toolbox.register('individual',tools.initCycle,creator.Individual,(toolbox.rf_depth,toolbox.xgb_max_depth,toolbox.xgb_eta,toolbox.buy_th,toolbox.sell_th),n=1)
-    toolbox.register('population',tools.initRepeat,list,toolbox.individual)
+# -------------------- GA (hafif) --------------------
+def ga_optimize_params_light(df, start_cap, win_size, n_gen=8,pop_size=10):
+    creator.create('FitnessMax', base.Fitness, weights=(1.0,), overwrite=True)
+    creator.create('Individual', list, fitness=creator.FitnessMax, overwrite=True)
+    toolbox = base.Toolbox()
+    toolbox.register('rf_depth', np.random.randint,3,13)
+    toolbox.register('xgb_max_depth', np.random.randint,2,7)
+    toolbox.register('xgb_eta', np.random.uniform,0.01,0.3)
+    toolbox.register('buy_th', np.random.uniform,0.05,0.5)
+    toolbox.register('sell_th', np.random.uniform,-0.5,-0.05)
+    toolbox.register('individual', tools.initCycle, creator.Individual,
+                     (toolbox.rf_depth,toolbox.xgb_max_depth,toolbox.xgb_eta,toolbox.buy_th,toolbox.sell_th), n=1)
+    toolbox.register('population', tools.initRepeat, list, toolbox.individual)
     def eval_individual(ind):
-        rf_depth,xgb_md,xgb_eta,buy_th,sell_th=ind
-        xgb_params={'max_depth':int(xgb_md),'learning_rate':float(xgb_eta),'n_estimators':30,'tree_method':'hist','n_jobs':-1}
+        rf_depth, xgb_md, xgb_eta, buy_th, sell_th = ind
+        xgb_params = {'max_depth':int(xgb_md),'learning_rate':float(xgb_eta),'n_estimators':30,'tree_method':'hist','n_jobs':-1}
         params={'rf_depth':int(rf_depth),'xgb_params':xgb_params,'buy_th':float(buy_th),'sell_th':float(sell_th)}
-        splits=walk_forward_splits(df,n_splits=3); rois=[]
+        splits = walk_forward_splits(df,n_splits=3)
+        rois=[]
         for tr,val,tst in splits:
-            train_df=df.iloc[0:val.stop]; test_df=df.iloc[tst]
-            res=simulate_walk_forward(pd.concat([train_df,test_df]),start_cap,win_size,params=params)
+            train_df = df.iloc[0:val.stop]
+            test_df = df.iloc[tst]
+            res = simulate_walk_forward(pd.concat([train_df,test_df]),start_cap,win_size,params=params)
             rois.append(res['roi'])
         return (np.mean(rois),)
-    pop=toolbox.population(n=pop_size); hof=tools.HallOfFame(1)
-    stats=tools.Statistics(lambda ind: ind.fitness.values)
-    stats.register('avg',np.mean); stats.register('max',np.max)
+    pop = toolbox.population(n=pop_size)
+    hof = tools.HallOfFame(1)
+    stats = tools.Statistics(lambda ind: ind.fitness.values)
+    stats.register('avg',np.mean)
+    stats.register('max',np.max)
     algorithms.eaSimple(pop,toolbox,cxpb=0.5,mutpb=0.2,ngen=n_gen,stats=stats,halloffame=hof,verbose=False)
-    best=hof[0]; rf_depth,xgb_md,xgb_eta,buy_th,sell_th=best
+    best = hof[0]
+    rf_depth, xgb_md, xgb_eta, buy_th, sell_th = best
     best_params={'rf_depth':int(rf_depth),'xgb_params':{'max_depth':int(xgb_md),'learning_rate':float(xgb_eta),'n_estimators':30,'tree_method':'hist','n_jobs':-1},'buy_th':float(buy_th),'sell_th':float(sell_th)}
     return best_params
 
 # -------------------- RUN STRATEGY --------------------
 def run_strategy_enhanced(ticker,start_cap,win_size,use_ga_flag=False,ga_gens=8):
-    raw_df=get_raw_data(ticker)
-    if raw_df is None: return None
-    raw_df=raw_df.iloc[-1460:]; best_roi=-9999; best_res=None
+    raw_df = get_raw_data(ticker)
+    if raw_df is None:
+        return None
+    raw_df = raw_df.iloc[-1460:]
+    best_roi=-9999
+    best_res=None
     timeframes={'Günlük':'D','Haftalık':'W','Aylık':'M'}
     for tf_name,tf_code in timeframes.items():
-        df=process_data(raw_df,tf_code);
+        df=process_data(raw_df,tf_code)
         if df is None: continue
         params=None
         if use_ga_flag:
-            try: params=ga_optimize_params_light(df,start_cap,win_size,n_gen=ga_gens)
-            except: params=None
-        sim=simulate_walk_forward(df,start_cap,win_size,params=params)
-        final=sim['final']; roi=sim['roi']
-        if roi>best_roi:
-            start_p=df['close'].iloc[0]; end_p=df['close'].iloc[-1]
+            try:
+                params = ga_optimize_params_light(df,start_cap,win_size,n_gen=ga_gens)
+            except Exception:
+                params=None
+        sim = simulate_walk_forward(df,start_cap,win_size,params=params)
+        if sim['roi']>best_roi:
+            start_p=df['close'].iloc[0]
+            end_p=df['close'].iloc[-1]
             hodl_val=(start_cap/start_p)*end_p
-            best_roi=roi
-            best_res={'ticker':ticker,'tf':tf_name,'final':final,'roi':roi,'hodl':hodl_val,'equity':sim['equity'],'dates':sim['dates'],'kalman_data':df['kalman_close']}
+            best_roi=sim['roi']
+            best_res={'ticker':ticker,'tf':tf_name,'final':sim['final'],'roi':sim['roi'],'hodl':hodl_val,'equity':sim['equity'],'dates':sim['dates'],'kalman_data':df['kalman_close']}
     return best_res
 
 # -------------------- STREAMLIT --------------------
 if st.button("🛡️ ENHANCED ANALİZİ BAŞLAT"):
-    cols=st.columns(2); prog=st.progress(0); results=[]; start_time=time.time()
+    cols=st.columns(2)
+    prog=st.progress(0)
+    results=[]
+    start_time=time.time()
     for i,t in enumerate(selected_tickers):
         with cols[i%2]:
             with st.spinner(f"{t} için hesaplanıyor..."):
                 res=run_strategy_enhanced(t,capital,window_size,use_ga_flag=use_ga,ga_gens=int(ga_generations))
             if res:
                 results.append(res)
-                is_profit=res['roi']>0; color="#00ff00" if is_profit else "#ff4444"
+                is_profit = res['roi']>0
+                color = "#00ff00" if is_profit else "#ff4444"
+                alpha = res['final']-res['hodl']
                 st.markdown(f"**{t} — {res['tf']}** — ROI: {res['roi']:.2%}")
                 fig=go.Figure()
                 fig.add_trace(go.Scatter(x=res['dates'],y=res['equity'],name="Bot Bakiye"))
@@ -251,8 +321,14 @@ if st.button("🛡️ ENHANCED ANALİZİ BAŞLAT"):
         prog.progress((i+1)/len(selected_tickers))
     prog.empty()
     if results:
-        total_final=sum([r['final'] for r in results]); total_hodl=sum([r['hodl'] for r in results]); total_start=capital*len(results)
-        st.markdown('---'); st.markdown('### Portföy Özeti')
+        total_final=sum([r['final'] for r in results])
+        total_hodl=sum([r['hodl'] for r in results])
+        total_start=capital*len(results)
+        roi_percent=(total_final-total_start)/total_start*100
+        st.markdown('---')
+        st.markdown('### Portföy Özeti')
         c1,c2,c3=st.columns(3)
-        c1.metric('Toplam Başlangıç',f'${total_start:.0f}')
-        c2.metric('Kalman Bot Bitiş',f'${total_final:.2f}',f"%{((total_final-total_start)/total
+        c1.metric('Başlangıç', f"${total_start:.2f}", "")
+        c2.metric('Kalman Bot Bitiş', f"${total_final:.2f}", f"%{roi_percent:.2f}")
+        c3.metric('Hodl Karşılaştırma', f"${total_hodl:.2f}", f"${(total_final-total_hodl):.2f}")
+    st.success(f"Tamamlandı ({time.time()-start_time:.1f} s) ✅")
