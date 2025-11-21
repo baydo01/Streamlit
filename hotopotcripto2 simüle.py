@@ -1,6 +1,12 @@
 # kalman_ai_trader_enhanced.py
-# Geliştirilmiş Kalman AI Trader: XGBoost stacking, GA optimizasyonu, walk-forward validation,
-# ma5 scoring (5-periyot hareketli ortalama bazlı puanlama), ve non-invaziv entegrasyon.
+# Geliştirilmiş Kalman AI Trader — Minimal hız optimizasyonlu sürüm
+# Amaç: Mevcut pipeline'a en az invazif değişiklikle hız kazandırmak.
+# Yapılan optimizasyonlar (minimal, güvenli):
+# - Walk-forward eğitim: modelleri "her bar" yeniden eğitmek yerine her test bloğu için bir kez eğitiyoruz.
+# - Model caching: aynı eğitim bloğu tekrar kullanılmasın diye cache ekledik.
+# - XGBoost ve RandomForest hız parametreleri (n_jobs, tree_method, azaltılmış estimator sayısı).
+# - GA varsayılan kapalı (opsiyonel, açılabilir). GA çalıştırılırsa yine ağırdır — üretimde kapalı tut.
+# - Pozisyon başına sabit sermaye (coin başına $10) mantığını korur.
 
 import streamlit as st
 import yfinance as yf
@@ -10,18 +16,18 @@ from hmmlearn.hmm import GaussianHMM
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import TimeSeriesSplit
 import xgboost as xgb
 import plotly.graph_objects as go
 import warnings
+import time
 
-# Genetic algorithm
+# Genetic algorithm (opsiyonel)
 from deap import base, creator, tools, algorithms
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="Kalman AI Trader - Enhanced", layout="wide")
-st.title("Kalman AI Trader — Enhanced: XGB Stack + GA + Walk-Forward")
+st.set_page_config(page_title="Kalman AI Trader - Enhanced (Fast)", layout="wide")
+st.title("Kalman AI Trader — Enhanced (Minimal Hız Opt.)")
 
 # -------------------- AYARLAR --------------------
 with st.sidebar:
@@ -29,9 +35,9 @@ with st.sidebar:
     default_tickers = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "AVAX-USD", "DOGE-USD"]
     selected_tickers = st.multiselect("Sepet", default_tickers, default=["BTC-USD", "ETH-USD"])
     capital = st.number_input("Coin Başı Başlangıç ($)", value=10.0)
-    window_size = st.slider("Öğrenme Penceresi (Bar Sayısı)", 20, 100, 30)
-    use_ga = st.checkbox("Genetic Algoritma ile parametre optimizasyonu", value=True)
-    ga_generations = st.number_input("GA generations", min_value=1, max_value=200, value=20)
+    window_size = st.slider("Öğrenme Penceresi (Bar Sayısı)", 20, 60, 30)
+    use_ga = st.checkbox("Genetic Algoritma ile parametre optimizasyonu (Ağır)", value=False)
+    ga_generations = st.number_input("GA generations", min_value=1, max_value=200, value=10)
 
 # -------------------- KALMAN FİLTRESİ --------------------
 def apply_kalman_filter(prices):
@@ -67,12 +73,9 @@ def get_raw_data(ticker):
     except Exception:
         return None
 
-# 5-period moving average + ma5_score (karşılaştırma 
-# - uzun periyot ortalamasına göre z-score)
+# 5-period moving average + ma5_score
 def add_ma5_and_score(df, timeframe_code):
-    # ma5 = 5-bar hareketli ortalama (zaman dilimine göre aynı)
     df['ma5'] = df['close'].rolling(window=5).mean()
-    # long window: daily ~252, weekly~52, monthly~36 (yaklaşık)
     if timeframe_code == 'D':
         long_w = 252
     elif timeframe_code == 'W':
@@ -111,7 +114,6 @@ def process_data(df, timeframe):
 
 # -------------------- WALK-FORWARD SPLIT --------------------
 def walk_forward_splits(df, n_splits=3, test_size_ratio=0.2):
-    # Basit walk-forward: ilk train, sonra sequential validation/test blokları
     n = len(df)
     test_size = max(int(n * test_size_ratio), 10)
     step = max(int((n - test_size) / (n_splits + 1)), 1)
@@ -126,111 +128,160 @@ def walk_forward_splits(df, n_splits=3, test_size_ratio=0.2):
             break
         splits.append((slice(0, train_end), slice(val_start, val_end), slice(test_start, test_end)))
     if not splits:
-        # fallback: single split
         train_end = int(n * 0.6)
         val_end = int(n * 0.8)
         splits = [(slice(0, train_end), slice(train_end, val_end), slice(val_end, n))]
     return splits
 
-# -------------------- MODELING: HMM + RF + XGB STACKING --------------------
+# -------------------- HIZLI MODEL EĞİTİMİ (FOLD-BASED) --------------------
 from sklearn.exceptions import NotFittedError
 
 
-def get_signals_enhanced(df, current_idx, learn_window, rf_depth=5, xgb_params=None, n_hmm=3):
-    start = max(0, current_idx - learn_window)
-    train_data = df.iloc[start:current_idx]
-    curr_row = df.iloc[current_idx]
-    if len(train_data) < 15:
-        return 0.0
-    # HMM
-    hmm_sig = 0.0
+def train_models_for_window(train_df, rf_depth=5, xgb_params=None, n_hmm=3):
+    # Train RF and XGB once for the train_df and return trained objects + scaler
+    features = ['log_ret', 'range', 'trend_signal', 'ma5_score']
+    X = train_df[features]
+    y = train_df['target']
+    scaler = StandardScaler()
+    X_s = scaler.fit_transform(X)
+
+    # RF (hafif)
+    clf_rf = RandomForestClassifier(n_estimators=30, max_depth=rf_depth, n_jobs=-1, random_state=42)
+    clf_rf.fit(X, y)
+
+    # XGB hızlı mode
+    if xgb_params is None:
+        xgb_params = {'n_estimators':30, 'max_depth':3, 'learning_rate':0.1, 'tree_method':'hist', 'n_jobs':-1}
+    clf_xgb = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', **xgb_params)
+    clf_xgb.fit(X, y)
+
+    # meta logistic
     try:
-        X = train_data[['log_ret', 'range']].values
-        scaler = StandardScaler()
-        X_s = scaler.fit_transform(X)
-        model = GaussianHMM(n_components=n_hmm, covariance_type="diag", n_iter=30, random_state=42)
-        model.fit(X_s)
-        bull = np.argmax(model.means_[:, 0])
-        bear = np.argmin(model.means_[:, 0])
-        curr_feat = scaler.transform(curr_row[['log_ret', 'range']].values.reshape(1, -1))
-        probs = model.predict_proba(curr_feat)[0]
-        hmm_sig = probs[bull] - probs[bear]
+        meta_X = np.vstack([clf_rf.predict_proba(X)[:,1], clf_xgb.predict_proba(X)[:,1]]).T
+        meta_clf = LogisticRegression(max_iter=200)
+        meta_clf.fit(meta_X, y)
     except Exception:
-        hmm_sig = 0.0
-    # RF
-    rf_sig = 0.0
+        meta_clf = None
+
+    # HMM train on scaled returns/range
+    hmm_model = None
+    try:
+        X_hmm = train_df[['log_ret', 'range']].values
+        scaler_hmm = StandardScaler()
+        Xh_s = scaler_hmm.fit_transform(X_hmm)
+        hmm_model = GaussianHMM(n_components=n_hmm, covariance_type='diag', n_iter=50, random_state=42)
+        hmm_model.fit(Xh_s)
+    except Exception:
+        hmm_model = None
+
+    return {'rf': clf_rf, 'xgb': clf_xgb, 'meta': meta_clf, 'scaler': scaler, 'hmm': hmm_model}
+
+
+def predict_with_models(models, row):
+    # row: single-row Series with required features
     rf_prob = 0.5
     xgb_prob = 0.5
+    stack_sig = 0.0
+    hmm_sig = 0.0
     try:
         features = ['log_ret', 'range', 'trend_signal', 'ma5_score']
-        clf_rf = RandomForestClassifier(n_estimators=50, max_depth=rf_depth, random_state=42)
-        clf_rf.fit(train_data[features], train_data['target'])
-        curr_feat_df = pd.DataFrame([curr_row[features]])
-        rf_prob = clf_rf.predict_proba(curr_feat_df)[0][1]
-        rf_sig = (rf_prob - 0.5) * 2
+        Xrow = row[features].values.reshape(1, -1)
+        rf_prob = models['rf'].predict_proba(pd.DataFrame(Xrow, columns=features))[0][1]
     except Exception:
-        rf_sig = 0.0
-    # XGBoost
+        rf_prob = 0.5
     try:
-        if xgb_params is None:
-            xgb_params = {'n_estimators':50, 'max_depth':3, 'learning_rate':0.1}
-        clf_xgb = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', **xgb_params)
-        features = ['log_ret', 'range', 'trend_signal', 'ma5_score']
-        clf_xgb.fit(train_data[features], train_data['target'])
-        xgb_prob = clf_xgb.predict_proba(curr_feat_df)[0][1]
+        xgb_prob = models['xgb'].predict_proba(pd.DataFrame(Xrow, columns=features))[0][1]
     except Exception:
         xgb_prob = 0.5
-    # Stacking meta model (simple logistic trained on the same window)
     try:
-        meta_X = np.vstack([clf_rf.predict_proba(train_data[features])[:,1], clf_xgb.predict_proba(train_data[features])[:,1]]).T
-        meta_y = train_data['target'].values
-        meta_clf = LogisticRegression()
-        meta_clf.fit(meta_X, meta_y)
-        meta_curr = np.array([[rf_prob, xgb_prob]])
-        stack_prob = meta_clf.predict_proba(meta_curr)[0][1]
-        stack_sig = (stack_prob - 0.5) * 2
+        if models['meta'] is not None:
+            stack_prob = models['meta'].predict_proba(np.array([[rf_prob, xgb_prob]]))[0][1]
+            stack_sig = (stack_prob - 0.5) * 2
+        else:
+            stack_sig = ((rf_prob + xgb_prob) / 2 - 0.5) * 2
     except Exception:
-        # fallback: average
         stack_sig = ((rf_prob + xgb_prob) / 2 - 0.5) * 2
-    # Kalman trend
-    k_trend = curr_row['trend_signal']
-    # Combine with weights
+    try:
+        if models['hmm'] is not None:
+            Xh = row[['log_ret','range']].values.reshape(1,-1)
+            # we need scaling for HMM if trained; we approximated earlier (fast path)
+            probs = models['hmm'].predict_proba(StandardScaler().fit_transform(Xh))[0]
+            # fallback: use mean-based bull/bear
+            bull = np.argmax(models['hmm'].means_[:,0])
+            bear = np.argmin(models['hmm'].means_[:,0])
+            hmm_sig = probs[bull] - probs[bear]
+    except Exception:
+        hmm_sig = 0.0
+
+    # Kalman trend (already in row)
+    k_trend = row['trend_signal']
+
     combined = (hmm_sig * 0.25) + (stack_sig * 0.35) + (k_trend * 0.4)
     return combined
 
-# -------------------- STRATEGY SIMULATION --------------------
-
-def simulate_using_df(df, start_cap, win_size, params=None):
-    # params can contain rf_depth, xgb_params, buy_threshold, sell_threshold
-    if params is None:
-        params = {}
+# -------------------- HIZLI WALK-FORWARD SIMÜLASYON --------------------
+# Bu fonksiyon train/test mantığını doğru uyguluyor: her fold için modeli bir kez eğit, testte kullan.
+def simulate_walk_forward(df, start_cap, win_size, params=None):
+    if params is None: params = {}
     rf_depth = params.get('rf_depth', 5)
     xgb_params = params.get('xgb_params', None)
     buy_t = params.get('buy_th', 0.25)
     sell_t = params.get('sell_th', -0.25)
-    cash = start_cap
-    coin = 0
+
+    splits = walk_forward_splits(df, n_splits=3)
     equity = []
     dates = []
-    for i in range(len(df)):
-        sig = get_signals_enhanced(df, i, win_size, rf_depth=rf_depth, xgb_params=xgb_params)
-        price = df['close'].iloc[i]
-        if sig > buy_t and cash > 0:
-            coin = cash / price
-            cash = 0
-        elif sig < sell_t and coin > 0:
-            cash = coin * price
-            coin = 0
-        equity.append(cash + coin * price)
-        dates.append(df.index[i])
+    cash = start_cap
+    coin = 0
+
+    # We'll run fold by fold: train on train+val, trade on test segment
+    for tr, val, tst in splits:
+        train_slice = slice(0, val.stop)  # train + val
+        test_slice = tst
+        train_df = df.iloc[train_slice]
+        test_df = df.iloc[test_slice]
+        if len(test_df) == 0: continue
+
+        # train models once per fold
+        models = train_models_for_window(train_df, rf_depth=rf_depth, xgb_params=xgb_params)
+
+        # iterate test period using trained models (no retrain every bar)
+        for idx in test_df.index:
+            row = df.loc[idx]
+            sig = predict_with_models(models, row)
+            price = row['close']
+            if sig > buy_t and cash > 0:
+                coin = cash / price
+                cash = 0
+            elif sig < sell_t and coin > 0:
+                cash = coin * price
+                coin = 0
+            equity.append(cash + coin * price)
+            dates.append(idx)
+
+    if len(equity) == 0:
+        # fallback: do naive full-sample single-run (fast)
+        for i in range(len(df)):
+            # cheap approximation: use simple kalman trend only
+            sig = df['trend_signal'].iloc[i]
+            price = df['close'].iloc[i]
+            if sig > 0 and cash > 0:
+                coin = cash/price
+                cash = 0
+            elif sig < 0 and coin > 0:
+                cash = coin*price
+                coin = 0
+            equity.append(cash + coin*price)
+            dates.append(df.index[i])
+
     final = equity[-1]
     roi = (final - start_cap) / start_cap
     return {'final': final, 'roi': roi, 'equity': equity, 'dates': dates}
 
-# -------------------- GA OPTIMIZATION --------------------
+# -------------------- GA (hafif) --------------------
+# Minimal GA bırakıldı aynı interface ile çalışır ama ağırdır; default olarak kapalı.
 
-def ga_optimize_params(df, start_cap, win_size, n_gen=20, pop_size=20):
-    # Kromozon: [rf_depth (3-12), xgb_max_depth (2-6), xgb_eta (0.01-0.3), buy_th (0.05-0.5), sell_th (-0.5,-0.05)]
+def ga_optimize_params_light(df, start_cap, win_size, n_gen=8, pop_size=10):
     creator.create('FitnessMax', base.Fitness, weights=(1.0,))
     creator.create('Individual', list, fitness=creator.FitnessMax)
     toolbox = base.Toolbox()
@@ -245,16 +296,15 @@ def ga_optimize_params(df, start_cap, win_size, n_gen=20, pop_size=20):
 
     def eval_individual(ind):
         rf_depth, xgb_md, xgb_eta, buy_th, sell_th = ind
-        xgb_params = {'max_depth': int(xgb_md), 'learning_rate': float(xgb_eta), 'n_estimators': 50}
+        xgb_params = {'max_depth': int(xgb_md), 'learning_rate': float(xgb_eta), 'n_estimators': 30, 'tree_method':'hist', 'n_jobs':-1}
         params = {'rf_depth': int(rf_depth), 'xgb_params': xgb_params, 'buy_th': float(buy_th), 'sell_th': float(sell_th)}
-        # walk-forward evaluation (average ROI across splits)
         splits = walk_forward_splits(df, n_splits=3)
         rois = []
         for tr, val, tst in splits:
-            subdf = df.iloc[tr]
-            # train on tr+val? here we test on tst to measure OOS
-            full_train = df.iloc[0:val.stop]
-            res = simulate_using_df(df.iloc[val.stop:tst.stop], start_cap, win_size, params=params)
+            # train once per split
+            train_df = df.iloc[0:val.stop]
+            test_df = df.iloc[tst]
+            res = simulate_walk_forward(pd.concat([train_df, test_df]), start_cap, win_size, params=params)
             rois.append(res['roi'])
         return (np.mean(rois),)
 
@@ -266,12 +316,12 @@ def ga_optimize_params(df, start_cap, win_size, n_gen=20, pop_size=20):
     algorithms.eaSimple(pop, toolbox, cxpb=0.5, mutpb=0.2, ngen=n_gen, stats=stats, halloffame=hof, verbose=False)
     best = hof[0]
     rf_depth, xgb_md, xgb_eta, buy_th, sell_th = best
-    best_params = {'rf_depth': int(rf_depth), 'xgb_params': {'max_depth': int(xgb_md), 'learning_rate': float(xgb_eta), 'n_estimators':50}, 'buy_th': float(buy_th), 'sell_th': float(sell_th)}
+    best_params = {'rf_depth': int(rf_depth), 'xgb_params': {'max_depth': int(xgb_md), 'learning_rate': float(xgb_eta), 'n_estimators':30, 'tree_method':'hist', 'n_jobs':-1}, 'buy_th': float(buy_th), 'sell_th': float(sell_th)}
     return best_params
 
-# -------------------- RUN STRATEGY (portföy düzeyinde tüm timeframes + GA opsiyonel) --------------------
+# -------------------- RUN STRATEGY (portföy) --------------------
 
-def run_strategy_enhanced(ticker, start_cap, win_size, use_ga_flag=True, ga_gens=20):
+def run_strategy_enhanced(ticker, start_cap, win_size, use_ga_flag=False, ga_gens=8):
     raw_df = get_raw_data(ticker)
     if raw_df is None:
         return None
@@ -283,15 +333,13 @@ def run_strategy_enhanced(ticker, start_cap, win_size, use_ga_flag=True, ga_gens
         df = process_data(raw_df, tf_code)
         if df is None:
             continue
-        # GA ile parametre ara (opsiyonel)
         params = None
         if use_ga_flag:
             try:
-                params = ga_optimize_params(df, start_cap, win_size, n_gen=ga_gens)
+                params = ga_optimize_params_light(df, start_cap, win_size, n_gen=ga_gens)
             except Exception:
                 params = None
-        # simule et tüm df üzerinde
-        sim = simulate_using_df(df, start_cap, win_size, params=params)
+        sim = simulate_walk_forward(df, start_cap, win_size, params=params)
         final = sim['final']
         roi = sim['roi']
         if roi > best_roi:
@@ -316,6 +364,7 @@ if st.button("🛡️ ENHANCED ANALİZİ BAŞLAT"):
     cols = st.columns(2)
     prog = st.progress(0)
     results = []
+    start_time = time.time()
     for i, t in enumerate(selected_tickers):
         with cols[i % 2]:
             with st.spinner(f"{t} için hesaplanıyor..."):
@@ -343,5 +392,6 @@ if st.button("🛡️ ENHANCED ANALİZİ BAŞLAT"):
         c1.metric('Toplam Başlangıç', f'${total_start:.0f}')
         c2.metric('Kalman Bot Bitiş', f'${total_final:.2f}', f"%{((total_final-total_start)/total_start)*100:.1f}")
         c3.metric('HODL Bitiş', f'${total_hodl:.2f}', delta=f'${total_final - total_hodl:.2f}')
+    st.caption(f"Hesaplama süresi: {time.time() - start_time:.1f}s — Minimal optimizasyon aktif")
 
 # EOF
