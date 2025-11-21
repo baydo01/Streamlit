@@ -11,328 +11,248 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="Smart Flow AI v2", layout="wide")
-st.title("🌊 Smart Flow AI: Hatasız & Optimize")
+st.set_page_config(page_title="Timeframe Master AI", layout="wide")
+st.title("⏳ Timeframe Master: Otomatik Zaman Seçimli AI")
 st.markdown("""
-Bu versiyonda:
-1.  **NameError Hatası:** Giderildi, grafikler çalışıyor.
-2.  **Daha Seçici:** Bot artık %25 (0.25) üzerinde güçlü sinyal görmedikçe alım yapmaz, **USD'de bekler.** Bu, düşüş piyasasında sermayeyi korur.
+Bu bot senin için şu soruyu çözer: **"Bu coine Günlük mü bakmalıyım, Haftalık mı?"**
+1.  **Veri Çekme:** Ham veriyi alır.
+2.  **Turnuva:** Günlük (D), Haftalık (W) ve Aylık (M) grafikleri oluşturur ve geçmişte test eder.
+3.  **Seçim:** En yüksek kârı getiren zaman dilimini (Timeframe) ve stratejiyi seçer.
+4.  **Uygulama:** Parayı o grafiğe göre yönetir.
 """)
 
 # --- AYARLAR ---
 with st.sidebar:
     st.header("⚙️ Ayarlar")
-    default_tickers = ["BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD", "AVAX-USD", "DOGE-USD", "LINK-USD"]
-    selected_tickers = st.multiselect("Havuzdaki Coinler", default_tickers, default=["BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD", "BNB-USD"])
+    default_tickers = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "AVAX-USD", "DOGE-USD", "LINK-USD"]
+    selected_tickers = st.multiselect("Sepet", default_tickers, default=["BTC-USD", "ETH-USD", "SOL-USD"])
     
-    total_capital = st.number_input("Toplam Fon Sermayesi ($)", value=10000)
-    test_days = st.number_input("Test Süresi (Gün)", value=90)
-    val_days = st.number_input("Validation Süresi (Gün)", value=45)
+    capital = st.number_input("Coin Başı Başlangıç ($)", value=10.0)
+    
+    # Test süresini uzun tutalım ki Haftalık/Aylık verilerde anlamlı olsun
+    lookback_days = st.slider("Analiz Geçmişi (Gün)", 365, 1095, 730) 
 
-# --- CORE MOTORLAR (HMM, TREND, RF) ---
-def get_data(ticker):
+# --- VERİ İŞLEME MOTORU (RESAMPLING DAHİL) ---
+def get_raw_data(ticker):
     try:
-        df = yf.download(ticker, period="2y", interval="1d", progress=False)
+        df = yf.download(ticker, period="5y", interval="1d", progress=False)
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         df.columns = [c.lower() for c in df.columns]
         if 'close' not in df.columns and 'adj close' in df.columns: df['close'] = df['adj close']
-        
-        df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
-        df['range'] = (df['high'] - df['low']) / df['close']
-        df['rsi'] = 100 - (100 / (1 + df['close'].pct_change().rolling(14).apply(lambda x: x[x>0].mean()/abs(x[x<0].mean()) if len(x[x<0])>0 else 0)))
-        df['ma_50'] = df['close'].rolling(50).mean()
-        df['dist_ma'] = (df['close'] - df['ma_50']) / df['ma_50']
-        df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
-        
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        df.fillna(0, inplace=True)
         return df
-    except: return pd.DataFrame()
+    except: return None
 
-def get_hmm_signal(train_df, current_feat, n_states):
+def process_data(df, timeframe):
+    """
+    Veriyi istenen zaman dilimine (D/W/M) çevirir ve indikatörleri ekler.
+    """
+    if df is None or len(df) < 50: return None
+    
+    # Resampling (Yeniden Örnekleme)
+    agg_dict = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+    
+    if timeframe == 'W':
+        df_res = df.resample('W').agg(agg_dict).dropna()
+    elif timeframe == 'M':
+        df_res = df.resample('ME').agg(agg_dict).dropna()
+    else: # Daily
+        df_res = df.copy()
+    
+    if len(df_res) < 30: return None # Yetersiz veri
+    
+    # Feature Engineering (Zaman dilimine göre dinamik)
+    # Log Return
+    df_res['log_ret'] = np.log(df_res['close'] / df_res['close'].shift(1))
+    
+    # Range (Volatilite)
+    df_res['range'] = (df_res['high'] - df_res['low']) / df_res['close']
+    
+    # Trend (SMA)
+    df_res['ma_short'] = df_res['close'].rolling(10).mean()
+    df_res['dist_ma'] = (df_res['close'] - df_res['ma_short']) / df_res['ma_short']
+    
+    # Momentum (RSI benzeri basit)
+    df_res['mom'] = df_res['close'].pct_change(4) # 4 bar öncesine göre değişim
+    
+    # Target (Gelecek 1 bar artacak mı?)
+    df_res['target'] = (df_res['close'].shift(-1) > df_res['close']).astype(int)
+    
+    df_res.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df_res.dropna(inplace=True)
+    
+    return df_res
+
+# --- MODELLER (HMM + RF + TREND) ---
+def get_signals(df, current_idx, n_hmm, d_rf):
+    # Rolling Window: Geçmiş 50 bar (Gün/Hafta/Ay neyse)
+    start = max(0, current_idx - 50)
+    train_data = df.iloc[start:current_idx]
+    curr_row = df.iloc[current_idx]
+    
+    if len(train_data) < 20: return 0
+    
+    # 1. HMM Sinyali
+    hmm_sig = 0
     try:
-        X = train_df[['log_ret', 'range']].values
+        X = train_data[['log_ret', 'range']].values
         scaler = StandardScaler()
         X_s = scaler.fit_transform(X)
-        model = GaussianHMM(n_components=n_states, covariance_type="diag", n_iter=50, random_state=42)
+        model = GaussianHMM(n_components=n_hmm, covariance_type="diag", n_iter=20, random_state=42)
         model.fit(X_s)
-        means = model.means_[:, 0]
-        bull = np.argmax(means)
-        bear = np.argmin(means)
-        curr_s = scaler.transform(current_feat.reshape(1, -1))
-        probs = model.predict_proba(curr_s)[0]
-        return probs[bull] - probs[bear]
-    except: return 0
-
-def get_linear_trend_signal(history_prices):
+        bull = np.argmax(model.means_[:, 0])
+        bear = np.argmin(model.means_[:, 0])
+        
+        curr_feat = scaler.transform(curr_row[['log_ret', 'range']].values.reshape(1, -1))
+        probs = model.predict_proba(curr_feat)[0]
+        hmm_sig = probs[bull] - probs[bear]
+    except: pass
+    
+    # 2. Random Forest Sinyali
+    rf_sig = 0
     try:
-        lookback = 30
-        if len(history_prices) < lookback: return 0
-        prices = history_prices.iloc[-lookback:].values.reshape(-1, 1)
-        X = np.arange(len(prices)).reshape(-1, 1)
-        reg = LinearRegression().fit(X, prices)
-        pred = reg.predict(np.array([[lookback]]))[0][0]
-        curr = prices[-1][0]
-        if pred > curr * 1.002: return 1
-        elif pred < curr * 0.998: return -1
-        else: return 0
-    except: return 0
-
-def get_rf_signal(train_df, current_feat_row, max_depth):
-    try:
-        features = ['log_ret', 'range', 'rsi', 'dist_ma']
-        X = train_df[features]
-        y = train_df['target']
-        clf = RandomForestClassifier(n_estimators=50, max_depth=max_depth, random_state=42)
-        clf.fit(X, y)
-        curr_x = pd.DataFrame([current_feat_row], columns=features)
-        prob = clf.predict_proba(curr_x)[0][1]
-        return (prob - 0.5) * 2
-    except: return 0
-
-def tune_parameters(df, val_start, val_end):
-    val_data = df.iloc[val_start:val_end]
-    train_ref = df.iloc[:val_start]
-    if len(train_ref) < 50: return 3, 5
+        features = ['log_ret', 'range', 'dist_ma', 'mom']
+        clf = RandomForestClassifier(n_estimators=30, max_depth=d_rf, random_state=42)
+        clf.fit(train_data[features], train_data['target'])
+        
+        curr_feat = pd.DataFrame([curr_row[features]])
+        prob = clf.predict_proba(curr_feat)[0][1]
+        rf_sig = (prob - 0.5) * 2
+    except: pass
     
-    best_hmm_n = 3; best_roi = -999
-    for n in [2, 3]:
-        sub_val = val_data.iloc[-20:] 
-        cash=1000; coin=0
-        for i in range(len(sub_val)):
-            row = sub_val.iloc[i]
-            sig = get_hmm_signal(train_ref, row[['log_ret', 'range']].values, n)
-            p = row['close']
-            if sig > 0.1 and cash>0: coin=cash/p; cash=0
-            elif sig < -0.1 and coin>0: cash=coin*p; coin=0
-        final = cash + (coin * sub_val.iloc[-1]['close'])
-        if final > best_roi: best_roi = final; best_hmm_n = n
-            
-    best_rf_depth = 5; best_acc = 0
-    features = ['log_ret', 'range', 'rsi', 'dist_ma']
-    for d in [3, 7]:
-        clf = RandomForestClassifier(n_estimators=30, max_depth=d, random_state=42)
-        clf.fit(train_ref[features], train_ref['target'])
-        preds = clf.predict(val_data[features])
-        acc = np.mean(preds == val_data['target'])
-        if acc > best_acc: best_acc = acc; best_rf_depth = d
-    return best_hmm_n, best_rf_depth
-
-# --- SİNYAL ÜRETİMİ (PRE-CALCULATION) ---
-def generate_signals(tickers, t_days, v_days):
-    signal_matrix = {}
-    tuning_results = {}
-    common_dates = None
-    progress_bar = st.progress(0)
-    status = st.empty()
-    coin_data = {} 
+    # 3. Basit Trend
+    trend_sig = 1 if curr_row['close'] > curr_row['ma_short'] else -1
     
-    for i, t in enumerate(tickers):
-        status.text(f"Veri İndiriliyor: {t}...")
-        df = get_data(t)
-        if len(df) < (t_days + v_days + 60): continue
-        coin_data[t] = df
-        if common_dates is None: common_dates = df.index[-t_days:]
-        else: common_dates = common_dates.intersection(df.index[-t_days:])
-        progress_bar.progress((i+1) / (len(tickers)*2))
+    # EŞİT AĞIRLIKLI ORTALAMA (Basit ve Etkili)
+    return (hmm_sig + rf_sig + trend_sig) / 3.0
 
-    if common_dates is None or len(common_dates) == 0: return None, None, None
-
-    final_signals = pd.DataFrame(index=common_dates, columns=tickers)
-    price_matrix = pd.DataFrame(index=common_dates, columns=tickers)
+# --- TURNUVA VE SİMÜLASYON ---
+def run_strategy(ticker, start_cap, history_days):
+    raw_df = get_raw_data(ticker)
+    if raw_df is None: return None
     
-    idx_counter = 0
-    for t in tickers:
-        if t not in coin_data: continue
-        status.text(f"Yapay Zeka Modelleri Eğitiliyor: {t}...")
-        df = coin_data[t]
-        
-        test_start_idx = df.index.get_loc(common_dates[0])
-        val_start_idx = test_start_idx - v_days
-        best_n, best_depth = tune_parameters(df, val_start_idx, test_start_idx)
-        tuning_results[t] = f"{best_n} State | {best_depth} Depth"
-        
-        errors = {'HMM': 1.0, 'TREND': 1.0, 'RF': 1.0}
-        signals = []
-        for date in common_dates:
-            curr_idx = df.index.get_loc(date)
-            train_window = df.iloc[curr_idx-60:curr_idx]
-            curr = df.iloc[curr_idx]
-            
-            hmm_sig = get_hmm_signal(train_window, curr[['log_ret', 'range']].values, best_n)
-            trend_sig = get_linear_trend_signal(train_window['close'])
-            rf_sig = get_rf_signal(train_window, curr[['log_ret', 'range', 'rsi', 'dist_ma']], best_depth)
-            
-            inv_total = (1/errors['HMM']) + (1/errors['TREND']) + (1/errors['RF'])
-            w_hmm = (1/errors['HMM']) / inv_total
-            w_trend = (1/errors['TREND']) / inv_total
-            w_rf = (1/errors['RF']) / inv_total
-            
-            final_sig = (hmm_sig * w_hmm) + (trend_sig * w_trend) + (rf_sig * w_rf)
-            signals.append(final_sig)
-            
-            if curr_idx + 1 < len(df):
-                actual_move = np.sign(df.iloc[curr_idx+1]['close'] - curr['close'])
-                decay = 0.90
-                errors['HMM'] = (errors['HMM']*decay) + (abs(np.sign(hmm_sig)-actual_move)*(1-decay))
-                errors['TREND'] = (errors['TREND']*decay) + (abs(np.sign(trend_sig)-actual_move)*(1-decay))
-                errors['RF'] = (errors['RF']*decay) + (abs(np.sign(rf_sig)-actual_move)*(1-decay))
-                for k in errors: errors[k] = max(errors[k], 0.01)
-
-        final_signals[t] = signals
-        price_matrix[t] = df.loc[common_dates]['close']
-        idx_counter += 1
-        progress_bar.progress(0.5 + (idx_counter/len(tickers)*0.5))
-
-    status.empty()
-    progress_bar.empty()
-    return final_signals, price_matrix, tuning_results
-
-# --- PORTFÖY SİMÜLASYONU (SMART FLOW) ---
-def run_smart_portfolio(signals, prices, initial_capital):
-    cash = initial_capital
-    holdings = {t: 0 for t in signals.columns}
-    equity_curve = []
-    dates = signals.index
-    allocation_history = []
+    # Son 'history_days' kadar veriyi al
+    raw_df = raw_df.iloc[-history_days:]
     
-    # !!! KRİTİK AYAR: Eşik Değeri Yükseltildi !!!
-    # Eski: 0.2 -> Çok sık alıyordu.
-    # Yeni: 0.25 -> Daha emin olunca alıyor.
-    BUY_THRESH = 0.25 
+    best_roi = -9999
+    best_result = None
+    best_config = ""
     
-    for date in dates:
-        current_equity = cash
-        for t, qty in holdings.items():
-            current_equity += qty * prices.loc[date, t]
+    # --- 1. TURNUVA: ZAMAN DİLİMLERİ ---
+    timeframes = {'Günlük (D)': 'D', 'Haftalık (W)': 'W', 'Aylık (M)': 'M'}
+    
+    for tf_name, tf_code in timeframes.items():
+        # Veriyi hazırla
+        df = process_data(raw_df, tf_code)
+        if df is None: continue
+        
+        # Validasyon (Test) Simülasyonu
+        cash = start_cap
+        coin = 0
+        equity = []
+        dates = []
+        
+        # Basit parametrelerle hızlı test (3 State HMM, 5 Depth RF)
+        for i in range(len(df)):
+            sig = get_signals(df, i, 3, 5)
+            price = df['close'].iloc[i]
             
-        daily_signals = signals.loc[date]
-        buy_candidates = daily_signals[daily_signals > BUY_THRESH].index.tolist()
-        
-        if len(buy_candidates) > 0:
-            target_per_coin = current_equity / len(buy_candidates)
+            # İşlem
+            if sig > 0.2 and cash > 0:
+                coin = cash / price
+                cash = 0
+            elif sig < -0.2 and coin > 0:
+                cash = coin * price
+                coin = 0
             
-            # Satışlar
-            for t in holdings:
-                if t not in buy_candidates and holdings[t] > 0:
-                    revenue = holdings[t] * prices.loc[date, t]
-                    cash += revenue * 0.999 
-                    holdings[t] = 0
+            equity.append(cash + (coin * price))
+            dates.append(df.index[i])
             
-            # Alımlar
-            for t in buy_candidates:
-                current_pos_val = holdings[t] * prices.loc[date, t]
-                if current_pos_val < target_per_coin:
-                    needed = target_per_coin - current_pos_val
-                    if cash >= needed:
-                        qty_to_buy = (needed * 0.999) / prices.loc[date, t]
-                        holdings[t] += qty_to_buy
-                        cash -= needed
-                    else:
-                        if cash > 0:
-                            qty_to_buy = (cash * 0.999) / prices.loc[date, t]
-                            holdings[t] += qty_to_buy
-                            cash = 0
-                elif current_pos_val > target_per_coin * 1.05:
-                    excess = current_pos_val - target_per_coin
-                    qty_to_sell = excess / prices.loc[date, t]
-                    holdings[t] -= qty_to_sell
-                    cash += excess * 0.999
-        else:
-            # HEPSİNİ SAT -> USD (CASH)
-            for t in holdings:
-                if holdings[t] > 0:
-                    cash += holdings[t] * prices.loc[date, t] * 0.999
-                    holdings[t] = 0
+        final_val = equity[-1]
+        roi = (final_val - start_cap) / start_cap
         
-        final_equity = cash
-        for t, qty in holdings.items():
-            final_equity += qty * prices.loc[date, t]
-        
-        equity_curve.append(final_equity)
-        
-        # Alokasyon Kaydı
-        if final_equity > 0:
-            alloc = {t: (holdings[t]*prices.loc[date, t])/final_equity for t in holdings}
-            alloc['CASH'] = cash / final_equity
-        else:
-            alloc = {t: 0 for t in holdings}
-            alloc['CASH'] = 1.0
-        allocation_history.append(alloc)
-        
-    return equity_curve, allocation_history
+        # Eğer bu zaman dilimi daha iyiyse, Şampiyon yap
+        if roi > best_roi:
+            best_roi = roi
+            best_result = {
+                'ticker': ticker,
+                'final': final_val,
+                'roi': roi,
+                'equity': equity,
+                'dates': dates,
+                'tf_name': tf_name
+            }
+            
+            # HODL Hesabı (O zaman diliminin başı ve sonuna göre)
+            start_p = df['close'].iloc[0]
+            end_p = df['close'].iloc[-1]
+            hodl_val = (start_cap / start_p) * end_p
+            best_result['hodl_val'] = hodl_val
+            best_result['hodl_roi'] = (hodl_val - start_cap) / start_cap
+
+    return best_result
 
 # --- ARAYÜZ ---
-if st.button("🌊 SİSTEMİ BAŞLAT"):
-    if not selected_tickers: st.error("Coin seçin.")
-    else:
-        with st.spinner("Modeller çalışıyor..."):
-            sig_df, price_df, tunings = generate_signals(selected_tickers, test_days, val_days)
+if st.button("⏳ ZAMAN MAKİNESİNİ ÇALIŞTIR"):
+    cols = st.columns(2)
+    results = []
+    
+    progress = st.progress(0)
+    
+    for i, t in enumerate(selected_tickers):
+        with cols[i % 2]:
+            with st.spinner(f"{t} için en iyi zaman dilimi aranıyor..."):
+                res = run_strategy(t, capital, lookback_days)
+            
+            if res:
+                results.append(res)
+                
+                # Renkler
+                is_profit = res['roi'] > 0
+                color = "#00ff00" if is_profit else "#ff4444"
+                alpha = res['final'] - res['hodl_val']
+                
+                # KART GÖRÜNÜMÜ
+                st.markdown(f"""
+                <div style="border: 1px solid {color}; padding: 15px; border-radius: 10px; margin-bottom: 10px; background-color: rgba(255,255,255,0.05)">
+                    <div style="display:flex; justify-content:space-between;">
+                        <h3 style="margin:0">{t}</h3>
+                        <span style="background-color:#333; padding:2px 8px; border-radius:5px; font-size:0.8em;">🏆 {res['tf_name']}</span>
+                    </div>
+                    <hr style="margin:5px 0; border-color:#444;">
+                    <div style="display:flex; justify-content:space-between; align-items:end;">
+                        <div>
+                            <div style="font-size:0.8em; color:gray">Bot Sonuç</div>
+                            <div style="font-size:1.5em; font-weight:bold; color:{color}">${res['final']:.2f}</div>
+                        </div>
+                        <div style="text-align:right;">
+                            <div style="font-size:0.8em; color:gray">HODL Sonuç</div>
+                            <div style="font-size:1.1em;">${res['hodl_val']:.2f}</div>
+                            <div style="font-size:0.8em; color:{'#0f0' if alpha>0 else '#f44'}">Alpha: {alpha:+.2f}$</div>
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)# Grafik
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=res['dates'], y=res['equity'], name="Bot", line=dict(color=color, width=2)))
+                # HODL Referans (Başlangıç ve Bitiş Noktası)
+                fig.add_trace(go.Scatter(x=[res['dates'][0], res['dates'][-1]], y=[capital, res['hodl_val']], 
+                                         name="HODL", line=dict(color="gray", dash="dot")))
+                
+                fig.update_layout(height=150, margin=dict(t=0,b=0,l=0,r=0), showlegend=False, template="plotly_dark")
+                st.plotly_chart(fig, use_container_width=True)
         
-        if sig_df is not None:
-            equity, alloc_hist = run_smart_portfolio(sig_df, price_df, total_capital)
-            
-            final_bal = equity[-1]
-            roi = (final_bal - total_capital) / total_capital
-            
-            # Benchmark (HODL)
-            bench_final = 0
-            per_coin_inv = total_capital / len(selected_tickers)
-            for t in selected_tickers:
-                start_p = price_df[t].iloc[0]
-                end_p = price_df[t].iloc[-1]
-                bench_final += (per_coin_inv / start_p) * end_p
-            
-            bench_roi = (bench_final - total_capital) / total_capital
-            alpha = roi - bench_roi
-            
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Smart Flow Kasa", f"${final_bal:,.0f}", f"%{roi*100:.1f}")
-            c2.metric("Statik Sepet (HODL)", f"${bench_final:,.0f}", f"%{bench_roi*100:.1f}")
-            c3.metric("ALPHA", f"%{alpha*100:.1f}", delta_color="normal")
-            
-            # Grafik 1: Performans
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=sig_df.index, y=equity, name="Smart Flow", line=dict(color="#00ff00", width=3)))
-            
-            bench_curve = []
-            for date in sig_df.index:
-                val = 0
-                for t in selected_tickers:
-                    start_p = price_df[t].iloc[0]
-                    curr_p = price_df.loc[date, t]
-                    val += (per_coin_inv / start_p) * curr_p
-                bench_curve.append(val)
-            fig.add_trace(go.Scatter(x=sig_df.index, y=bench_curve, name="HODL Sepeti", line=dict(color="gray", dash="dot")))
-            fig.update_layout(title="Portföy Performansı", template="plotly_dark", height=400)
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Grafik 2: Para Akışı (HATA BURADAYDI)
-            st.markdown("### 📊 Para Akışı: Sermaye Nereye Gidiyor?")
-            st.caption("Gri alan USD (Güvenli Liman), Renkli alanlar Coin yatırımlarıdır.")
-            
-            # --- DÜZELTME: allocation_history değişkenini doğru aldık ---
-            alloc_df = pd.DataFrame(alloc_hist, index=sig_df.index)
-            
-            fig2 = go.Figure()
-            # CASH
-            fig2.add_trace(go.Scatter(
-                x=alloc_df.index, y=alloc_df['CASH'],
-                mode='lines', stackgroup='one', name='NAKİT (USD)',
-                line=dict(width=0.5, color='gray')
-            ))
-            # Coinler
-            for t in selected_tickers:
-                fig2.add_trace(go.Scatter(
-                    x=alloc_df.index, y=alloc_df[t],
-                    mode='lines', stackgroup='one', name=t,
-                    line=dict(width=0.5)
-                ))
-            
-            fig2.update_layout(
-                yaxis=dict(title="Portföy Oranı (0-1)", range=[0, 1]),
-                template="plotly_dark", height=450
-            )
-            st.plotly_chart(fig2, use_container_width=True)
-            
-            st.write("Modellerin Kullandığı Ayarlar:", tunings)
+        progress.progress((i+1)/len(selected_tickers))
+    
+    progress.empty()
+    
+    if results:
+        total_start = capital * len(results)
+        total_end = sum([r['final'] for r in results])
+        total_hodl = sum([r['hodl_val'] for r in results])
+        
+        st.markdown("---")
+        st.markdown("### 🏆 PORTFÖY ÖZETİ")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Başlangıç", f"${total_start:.0f}")
+        c2.metric("Bot Bitiş", f"${total_end:.2f}", f"%{((total_end-total_start)/total_start)*100:.1f}")
+        c3.metric("HODL Bitiş", f"${total_hodl:.2f}", delta=f"${total_end - total_hodl:.2f}")
