@@ -4,37 +4,74 @@ import pandas as pd
 import numpy as np
 from hmmlearn.hmm import GaussianHMM
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
 import plotly.graph_objects as go
 import warnings
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="Timeframe Master AI", layout="wide")
-st.title("⏳ Timeframe Master: Otomatik Zaman Seçimli AI")
+st.set_page_config(page_title="Kalman AI Trader", layout="wide")
+st.title("🛡️ Kalman AI: Gürültüsüz Trend & Dinamik Zaman")
 st.markdown("""
-Bu bot senin için şu soruyu çözer: **"Bu coine Günlük mü bakmalıyım, Haftalık mı?"**
-1.  **Veri Çekme:** Ham veriyi alır.
-2.  **Turnuva:** Günlük (D), Haftalık (W) ve Aylık (M) grafikleri oluşturur ve geçmişte test eder.
-3.  **Seçim:** En yüksek kârı getiren zaman dilimini (Timeframe) ve stratejiyi seçer.
-4.  **Uygulama:** Parayı o grafiğe göre yönetir.
+Bu model, bir önceki "Timeframe Master" yapısını **Kalman Filtresi** ile güçlendirir.
+1.  **Kalman Filtresi:** Fiyattaki anlık sapmaları (gürültü) temizler, gerçek rotayı çizer.
+2.  **Dinamik Pencere:** Aylık grafikte son 30 ayı, Günlük grafikte son 30 günü baz alır.
+3.  **Turnuva:** Her coin için en temiz sinyali veren zaman dilimini otomatik seçer.
 """)
 
 # --- AYARLAR ---
 with st.sidebar:
     st.header("⚙️ Ayarlar")
-    default_tickers = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "AVAX-USD", "DOGE-USD", "LINK-USD"]
+    default_tickers = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "AVAX-USD", "DOGE-USD"]
     selected_tickers = st.multiselect("Sepet", default_tickers, default=["BTC-USD", "ETH-USD", "SOL-USD"])
     
     capital = st.number_input("Coin Başı Başlangıç ($)", value=10.0)
     
-    # Test süresini uzun tutalım ki Haftalık/Aylık verilerde anlamlı olsun
-    lookback_days = st.slider("Analiz Geçmişi (Gün)", 365, 1095, 730) 
+    # "Dinamik Pencere" boyutu.
+    # Aylık seçilirse son 30 ay, Günlük seçilirse son 30 gün eğitim verisi olur.
+    window_size = st.slider("Öğrenme Penceresi (Bar Sayısı)", 20, 100, 30) 
 
-# --- VERİ İŞLEME MOTORU (RESAMPLING DAHİL) ---
+# --- KALMAN FİLTRESİ (MATEMATİKSEL MOTOR) ---
+def apply_kalman_filter(prices):
+    """
+    Basitleştirilmiş 1D Kalman Filtresi.
+    Fiyat serisini pürüzsüzleştirir (Denoising).
+    """
+    # Başlangıç parametreleri
+    n_iter = len(prices)
+    sz = (n_iter,) # size
+    
+    # Q: Process variance (Sistemin hatası)
+    # R: Measurement variance (Ölçüm hatası - Gürültü)
+    Q = 1e-5 
+    R = 0.01**2 
+
+    # Başlangıç tahminleri
+    xhat = np.zeros(sz)      # Posteriori estimate
+    P = np.zeros(sz)         # Posteriori error estimate
+    xhatminus = np.zeros(sz) # Priori estimate
+    Pminus = np.zeros(sz)    # Priori error estimate
+    K = np.zeros(sz)         # Kalman gain
+
+    xhat[0] = prices.iloc[0]
+    P[0] = 1.0
+
+    for k in range(1, n_iter):
+        # Time Update (Prediction)
+        xhatminus[k] = xhat[k-1]
+        Pminus[k] = P[k-1] + Q
+
+        # Measurement Update (Correction)
+        K[k] = Pminus[k] / (Pminus[k] + R)
+        xhat[k] = xhatminus[k] + K[k] * (prices.iloc[k] - xhatminus[k])
+        P[k] = (1 - K[k]) * Pminus[k]
+        
+    return pd.Series(xhat, index=prices.index)
+
+# --- VERİ İŞLEME ---
 def get_raw_data(ticker):
     try:
+        # Max veri alıyoruz, içeride kırpacağız
         df = yf.download(ticker, period="5y", interval="1d", progress=False)
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         df.columns = [c.lower() for c in df.columns]
@@ -43,38 +80,35 @@ def get_raw_data(ticker):
     except: return None
 
 def process_data(df, timeframe):
-    """
-    Veriyi istenen zaman dilimine (D/W/M) çevirir ve indikatörleri ekler.
-    """
-    if df is None or len(df) < 50: return None
+    if df is None or len(df) < 100: return None
     
-    # Resampling (Yeniden Örnekleme)
+    # 1. RESAMPLING (Zaman Dilimi Dönüşümü)
     agg_dict = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
     
     if timeframe == 'W':
         df_res = df.resample('W').agg(agg_dict).dropna()
     elif timeframe == 'M':
         df_res = df.resample('ME').agg(agg_dict).dropna()
-    else: # Daily
+    else:
         df_res = df.copy()
     
-    if len(df_res) < 30: return None # Yetersiz veri
+    if len(df_res) < 50: return None
+
+    # 2. KALMAN FİLTRESİ UYGULAMA (Gürültü Temizliği)
+    # Ham kapanış fiyatı yerine Kalman'lanmış fiyatı kullanmak trendi netleştirir.
+    df_res['kalman_close'] = apply_kalman_filter(df_res['close'])
     
-    # Feature Engineering (Zaman dilimine göre dinamik)
-    # Log Return
-    df_res['log_ret'] = np.log(df_res['close'] / df_res['close'].shift(1))
+    # 3. FEATURE ENGINEERING (Kalman Fiyatı Üzerinden)
+    # Log Return (Kalman'a göre)
+    df_res['log_ret'] = np.log(df_res['kalman_close'] / df_res['kalman_close'].shift(1))
     
-    # Range (Volatilite)
+    # Volatilite (Gerçek fiyata göre, risk gerçektir)
     df_res['range'] = (df_res['high'] - df_res['low']) / df_res['close']
     
-    # Trend (SMA)
-    df_res['ma_short'] = df_res['close'].rolling(10).mean()
-    df_res['dist_ma'] = (df_res['close'] - df_res['ma_short']) / df_res['ma_short']
+    # Trend Sinyali (Fiyat Kalman'ın üstünde mi?)
+    df_res['trend_signal'] = np.where(df_res['close'] > df_res['kalman_close'], 1, -1)
     
-    # Momentum (RSI benzeri basit)
-    df_res['mom'] = df_res['close'].pct_change(4) # 4 bar öncesine göre değişim
-    
-    # Target (Gelecek 1 bar artacak mı?)
+    # Target (Gelecek hareket)
     df_res['target'] = (df_res['close'].shift(-1) > df_res['close']).astype(int)
     
     df_res.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -82,16 +116,19 @@ def process_data(df, timeframe):
     
     return df_res
 
-# --- MODELLER (HMM + RF + TREND) ---
-def get_signals(df, current_idx, n_hmm, d_rf):
-    # Rolling Window: Geçmiş 50 bar (Gün/Hafta/Ay neyse)
-    start = max(0, current_idx - 50)
+# --- MODELLER (HMM + RF + KALMAN TREND) ---
+def get_signals(df, current_idx, n_hmm, d_rf, learn_window):
+    # DİNAMİK PENCERE (Senin istediğin özellik)
+    # Eğer df Günlük ise, learn_window=30 -> 30 Gün alır.
+    # Eğer df Aylık ise, learn_window=30 -> 30 Ay alır.
+    start = max(0, current_idx - learn_window)
+    
     train_data = df.iloc[start:current_idx]
     curr_row = df.iloc[current_idx]
     
-    if len(train_data) < 20: return 0
+    if len(train_data) < 10: return 0
     
-    # 1. HMM Sinyali
+    # 1. HMM (Rejim)
     hmm_sig = 0
     try:
         X = train_data[['log_ret', 'range']].values
@@ -107,10 +144,10 @@ def get_signals(df, current_idx, n_hmm, d_rf):
         hmm_sig = probs[bull] - probs[bear]
     except: pass
     
-    # 2. Random Forest Sinyali
+    # 2. Random Forest (İndikatör)
     rf_sig = 0
     try:
-        features = ['log_ret', 'range', 'dist_ma', 'mom']
+        features = ['log_ret', 'range', 'trend_signal']
         clf = RandomForestClassifier(n_estimators=30, max_depth=d_rf, random_state=42)
         clf.fit(train_data[features], train_data['target'])
         
@@ -119,105 +156,102 @@ def get_signals(df, current_idx, n_hmm, d_rf):
         rf_sig = (prob - 0.5) * 2
     except: pass
     
-    # 3. Basit Trend
-    trend_sig = 1 if curr_row['close'] > curr_row['ma_short'] else -1
+    # 3. Kalman Trend
+    # Fiyat, Pürüzsüz Kalman çizgisinin üzerindeyse trend yukarıdır.
+    k_trend = curr_row['trend_signal']
     
-    # EŞİT AĞIRLIKLI ORTALAMA (Basit ve Etkili)
-    return (hmm_sig + rf_sig + trend_sig) / 3.0
+    # AĞIRLIKLANDIRMA
+    # Kalman trendi çok güçlü bir sinyaldir, ona biraz daha ağırlık verebiliriz.
+    return (hmm_sig * 0.3) + (rf_sig * 0.3) + (k_trend * 0.4)
 
-# --- TURNUVA VE SİMÜLASYON ---
-def run_strategy(ticker, start_cap, history_days):
+# --- SİMÜLASYON ---
+def run_strategy(ticker, start_cap, win_size):
     raw_df = get_raw_data(ticker)
     if raw_df is None: return None
     
-    # Son 'history_days' kadar veriyi al
-    raw_df = raw_df.iloc[-history_days:]
+    # Son 4 yılın verisini alalım ki Aylık analizde yeterli veri olsun
+    raw_df = raw_df.iloc[-1460:] 
     
     best_roi = -9999
-    best_result = None
-    best_config = ""
+    best_res = None
     
-    # --- 1. TURNUVA: ZAMAN DİLİMLERİ ---
-    timeframes = {'Günlük (D)': 'D', 'Haftalık (W)': 'W', 'Aylık (M)': 'M'}
+    timeframes = {'Günlük': 'D', 'Haftalık': 'W', 'Aylık': 'M'}
     
     for tf_name, tf_code in timeframes.items():
-        # Veriyi hazırla
         df = process_data(raw_df, tf_code)
         if df is None: continue
         
-        # Validasyon (Test) Simülasyonu
         cash = start_cap
         coin = 0
         equity = []
         dates = []
         
-        # Basit parametrelerle hızlı test (3 State HMM, 5 Depth RF)
+        # Simülasyon
         for i in range(len(df)):
-            sig = get_signals(df, i, 3, 5)
+            # Pencere boyutu (win_size) burada devreye giriyor
+            sig = get_signals(df, i, 3, 5, win_size)
             price = df['close'].iloc[i]
             
-            # İşlem
-            if sig > 0.2 and cash > 0:
+            # Eşikler (Kalman olduğu için sinyaller daha temiz, eşiği 0.25 tutabiliriz)
+            if sig > 0.25 and cash > 0:
                 coin = cash / price
                 cash = 0
-            elif sig < -0.2 and coin > 0:
+            elif sig < -0.25 and coin > 0:
                 cash = coin * price
                 coin = 0
             
             equity.append(cash + (coin * price))
             dates.append(df.index[i])
             
-        final_val = equity[-1]
-        roi = (final_val - start_cap) / start_cap
+        final = equity[-1]
+        roi = (final - start_cap) / start_cap
         
-        # Eğer bu zaman dilimi daha iyiyse, Şampiyon yap
         if roi > best_roi:
             best_roi = roi
-            best_result = {
-                'ticker': ticker,
-                'final': final_val,
-                'roi': roi,
-                'equity': equity,
-                'dates': dates,
-                'tf_name': tf_name
-            }
-            
-            # HODL Hesabı (O zaman diliminin başı ve sonuna göre)
+            # HODL Hesabı (O periyot için)
             start_p = df['close'].iloc[0]
             end_p = df['close'].iloc[-1]
             hodl_val = (start_cap / start_p) * end_p
-            best_result['hodl_val'] = hodl_val
-            best_result['hodl_roi'] = (hodl_val - start_cap) / start_cap
-
-    return best_result
+            
+            best_res = {
+                'ticker': ticker,
+                'tf': tf_name,
+                'final': final,
+                'roi': roi,
+                'hodl': hodl_val,
+                'equity': equity,
+                'dates': dates,
+                'kalman_data': df['kalman_close'] # Grafik için
+            }
+            
+    return best_res
 
 # --- ARAYÜZ ---
-if st.button("⏳ ZAMAN MAKİNESİNİ ÇALIŞTIR"):
+if st.button("🛡️ KALMAN DESTEKLİ ANALİZİ BAŞLAT"):
     cols = st.columns(2)
-    results = []
+    prog = st.progress(0)
     
-    progress = st.progress(0)
+    results = []
     
     for i, t in enumerate(selected_tickers):
         with cols[i % 2]:
-            with st.spinner(f"{t} için en iyi zaman dilimi aranıyor..."):
-                res = run_strategy(t, capital, lookback_days)
+            with st.spinner(f"{t} için en iyi zaman ve Kalman filtresi hesaplanıyor..."):
+                res = run_strategy(t, capital, window_size)
             
             if res:
                 results.append(res)
-                
-                # Renkler
                 is_profit = res['roi'] > 0
                 color = "#00ff00" if is_profit else "#ff4444"
-                alpha = res['final'] - res['hodl_val']
+                alpha = res['final'] - res['hodl']
                 
-                # KART GÖRÜNÜMÜ
+                # KART
                 st.markdown(f"""
                 <div style="border: 1px solid {color}; padding: 15px; border-radius: 10px; margin-bottom: 10px; background-color: rgba(255,255,255,0.05)">
                     <div style="display:flex; justify-content:space-between;">
                         <h3 style="margin:0">{t}</h3>
-                        <span style="background-color:#333; padding:2px 8px; border-radius:5px; font-size:0.8em;">🏆 {res['tf_name']}</span>
+                        <span style="background-color:#333; padding:2px 8px; border-radius:5px; font-size:0.8em;">🕒 {res['tf']}</span>
                     </div>
+                    <div style="font-size:0.8em; color:gray; margin-top:5px;">Kalman Filtresi Aktif ✅</div>
                     <hr style="margin:5px 0; border-color:#444;">
                     <div style="display:flex; justify-content:space-between; align-items:end;">
                         <div>
@@ -225,34 +259,43 @@ if st.button("⏳ ZAMAN MAKİNESİNİ ÇALIŞTIR"):
                             <div style="font-size:1.5em; font-weight:bold; color:{color}">${res['final']:.2f}</div>
                         </div>
                         <div style="text-align:right;">
-                            <div style="font-size:0.8em; color:gray">HODL Sonuç</div>
-                            <div style="font-size:1.1em;">${res['hodl_val']:.2f}</div>
-                            <div style="font-size:0.8em; color:{'#0f0' if alpha>0 else '#f44'}">Alpha: {alpha:+.2f}$</div>
+                            <div style="font-size:0.8em; color:gray">HODL</div>
+                            <div style="font-size:1.1em;">${res['hodl']:.2f}</div>
+                            <div style="font-size:0.8em; color:{'#0f0' if alpha>0 else '#f44'}">Fark: {alpha:+.2f}$</div>
                         </div>
                     </div>
                 </div>
-                """, unsafe_allow_html=True)# Grafik
+                """, unsafe_allow_html=True)
+                
+                # GRAFİK
                 fig = go.Figure()
-                fig.add_trace(go.Scatter(x=res['dates'], y=res['equity'], name="Bot", line=dict(color=color, width=2)))
-                # HODL Referans (Başlangıç ve Bitiş Noktası)
-                fig.add_trace(go.Scatter(x=[res['dates'][0], res['dates'][-1]], y=[capital, res['hodl_val']], 
-                                         name="HODL", line=dict(color="gray", dash="dot")))
+                # Bot Eğrisi
+                fig.add_trace(go.Scatter(x=res['dates'], y=res['equity'], name="Bot Bakiye", line=dict(color=color, width=2)))
+                # HODL Referans
+                fig.add_trace(go.Scatter(x=[res['dates'][0], res['dates'][-1]], y=[capital, res['hodl']], name="HODL", line=dict(color="gray", dash="dot")))
                 
                 fig.update_layout(height=150, margin=dict(t=0,b=0,l=0,r=0), showlegend=False, template="plotly_dark")
                 st.plotly_chart(fig, use_container_width=True)
-        
-        progress.progress((i+1)/len(selected_tickers))
+                
+        prog.progress((i+1)/len(selected_tickers))
     
-    progress.empty()
+    prog.empty()
     
     if results:
+        total_final = sum([r['final'] for r in results])
+        total_hodl = sum([r['hodl'] for r in results])
         total_start = capital * len(results)
-        total_end = sum([r['final'] for r in results])
-        total_hodl = sum([r['hodl_val'] for r in results])
         
         st.markdown("---")
         st.markdown("### 🏆 PORTFÖY ÖZETİ")
         c1, c2, c3 = st.columns(3)
-        c1.metric("Başlangıç", f"${total_start:.0f}")
-        c2.metric("Bot Bitiş", f"${total_end:.2f}", f"%{((total_end-total_start)/total_start)*100:.1f}")
-        c3.metric("HODL Bitiş", f"${total_hodl:.2f}", delta=f"${total_end - total_hodl:.2f}")
+        c1.metric("Toplam Başlangıç", f"${total_start:.0f}")
+        c2.metric("Kalman Bot Bitiş", f"${total_final:.2f}", f"%{((total_final-total_start)/total_start)*100:.1f}")
+        c3.metric("HODL Bitiş", f"${total_hodl:.2f}", delta=f"${total_final - total_hodl:.2f}")
+
+        # Bilgi Notu
+        st.info(f"""
+        ℹ️ **Sistem Nasıl Çalıştı?**
+        1. **Dinamik Pencere:** Seçilen "{window_size}" değeri; Günlük grafikte son {window_size} günü, Aylık grafikte son {window_size} ayı analiz etti.
+        2. **Gürültü Filtresi:** Kalman Filtresi, ani iğne atışlarını (wick) yoksaydı ve ana trende odaklandı.
+        """)
