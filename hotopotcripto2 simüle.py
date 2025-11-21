@@ -5,246 +5,247 @@ import numpy as np
 from hmmlearn.hmm import GaussianHMM
 from sklearn.preprocessing import StandardScaler
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import warnings
+from datetime import timedelta
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="Hedge Fund Lab: Portfolio Simulator", layout="wide")
-st.title("🏆 Hedge Fund: Tam Portföy Simülasyonu")
-st.markdown("Bu modül, tüm coinleri aynı anda simüle eder, her biri için en iyi stratejiyi bulur ve **Toplam Fon Performansını** gösterir.")
+st.set_page_config(page_title="AI Trader: Train/Test & Forecast", layout="wide")
+st.title("🧠 AI Trader: Self-Optimizing Model & Forecasting")
+st.markdown("""
+Bu model:
+1. **Train Data:** Geçmiş verilerle piyasa rejimlerini (HMM) öğrenir.
+2. **Test Data:** Son 2 ayı (görmediği veriyi) simüle eder.
+3. **Optimizasyon:** Test verisinde en yüksek kârı getiren **Ağırlık Kombinasyonunu** (AI vs Trend) kendi seçer.
+4. **Forecasting:** Bir sonraki mum (saat/gün) için yön tahmini yapar.
+""")
 
 # --- AYARLAR ---
 with st.sidebar:
-    st.header("⚙️ Fon Ayarları")
-    # Portföydeki tüm coinler
-    default_tickers = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "AVAX-USD", "DOGE-USD", "ADA-USD"]
-    selected_tickers = st.multiselect("Portföye Dahil Coinler", default_tickers, default=default_tickers)
-    
-    start_date = st.date_input("Başlangıç", value=pd.to_datetime("2020-01-01"))
-    initial_capital_per_coin = st.number_input("Coin Başına Sermaye ($)", value=1000)
-    commission = st.number_input("Komisyon Oranı", value=0.001, format="%.4f")
+    st.header("⚙️ Parametreler")
+    tickers = st.multiselect("Coinler", ["BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD", "XRP-USD"], default=["BTC-USD", "ETH-USD"])
+    interval = st.selectbox("Zaman Dilimi", ["1h", "1d"], index=1, help="1h seçerseniz son 730 gün verisi gelir.")
+    test_window = st.number_input("Test Periyodu (Gün)", value=60, help="Son kaç gün Test verisi olsun?")
+    capital = st.number_input("Başlangıç Sermayesi ($)", value=1000)
     
     st.markdown("---")
-    st.info("ℹ️ **Yeni Matematik:** Puanlama artık +1/-1 değil, yüzdesel değişime göre yapılıyor (Örn: %10 artış = 0.10 puan).")
+    st.info("Model, volatiliteyi HMM içine özellik olarak alır.")
 
-# --- 1. YENİ MATEMATİKSEL MOTOR (Yüzdesel Büyüklük) ---
-def calculate_custom_score_magnitude(df):
+# --- MATEMATİKSEL SKOR MOTORU (TREND AĞIRLIKLI) ---
+def calculate_technical_score(df):
     """
-    YENİ MANTIK: Sadece yöne (+/-) değil, hareketin BÜYÜKLÜĞÜNE (%) bakar.
+    Geleneksel indikatörler. HMM (Rejim) ile birleştirilmek üzere skor üretir.
+    Son dönem trendine daha duyarlıdır.
     """
-    if len(df) < 366: return pd.Series(0, index=df.index)
+    if len(df) < 50: return pd.Series(0, index=df.index)
     
-    # 1. Kısa Vade (5 Günlük % Değişim)
-    # Eğer %5 arttıysa skor +0.05 olur.
-    s1 = df['close'].pct_change(5).fillna(0)
+    # 1. EMA Cross (Kısa Vadeli Trend)
+    ema_short = df['close'].ewm(span=9, adjust=False).mean()
+    ema_long = df['close'].ewm(span=21, adjust=False).mean()
+    trend = np.where(ema_short > ema_long, 1, -1)
     
-    # 2. Orta Vade (35 Günlük % Değişim)
-    s2 = df['close'].pct_change(35).fillna(0)
+    # 2. Momentum (RSI Benzeri Hız)
+    momentum = df['close'].pct_change(14).fillna(0) * 10 # Katsayı ile büyüt
     
-    # 3. Uzun Vade (Tersine Mantık / Mean Reversion - 150 Gün)
-    # Eğer %50 düştüyse (-0.50), biz bunu pozitife çevirip +0.50 (AL) puanı yazarız.
-    # Eğer %200 arttıysa (2.0), biz bunu negatife çevirip -2.0 (SAT) puanı yazarız.
-    s3 = df['close'].pct_change(150).fillna(0) * -1 
+    # 3. Volatilite Bazlı Ağırlık (Volatilite artarsa trende güven azalır)
+    vol = df['close'].pct_change().rolling(20).std()
+    # Volatilite düşükse trend sinyali güçlüdür, yüksekse zayıflat.
+    vol_factor = 1 / (1 + (vol * 10))
     
-    # 4. Makro Trend (365 Günlük Eğim)
-    # Hareketli ortalamanın günlük % değişimi
-    ma = df['close'].rolling(365).mean()
-    s4 = ma.pct_change().fillna(0) * 100 # Küçük rakam olduğu için katsayı ile büyütüyoruz
-    
-    # 5. Volatilite (Risk)
-    # Oynaklık azalıyorsa (negatif değişim) -> İyi (+ Puan)
-    vol = df['close'].pct_change().rolling(10).std()
-    s5 = vol.pct_change().fillna(0) * -1 
-    
-    # 6. Hacim Gücü
-    # Hacim ortalamadan % kaç fazla?
-    if 'volume' in df.columns:
-        vol_ma = df['volume'].rolling(20).mean()
-        s6 = (df['volume'] - vol_ma) / vol_ma
-        s6 = s6.fillna(0)
-    else: s6 = 0
-    
-    # 7. Mum Gücü (Gövde büyüklüğü %)
-    if 'open' in df.columns:
-        s7 = (df['close'] - df['open']) / df['open']
-    else: s7 = 0
-    
-    # SKALALAMA (Scaling)
-    # Yüzdeler (0.05 gibi) HMM sinyaline (1.0) göre küçük kalabilir.
-    # Bu yüzden teknik puanların etkisini hissettirmek için bir katsayı (Impact Factor) ile çarpıyoruz.
-    IMPACT_FACTOR = 5.0 
-    total_score = (s1 + s2 + s3 + s4 + s5 + s6 + s7) * IMPACT_FACTOR
-    
-    return total_score
+    # Toplam Skor (-1 ile +1 arası normalize etmeye çalışıyoruz ama taşabilir)
+    score = (trend * 0.6) + (momentum * 0.4)
+    return pd.Series(score, index=df.index) * vol_factor
 
-# --- 2. TEK COIN İÇİN TURNUVA ---
-def run_strategy_for_coin(ticker, start_date, cap, comm):
+# --- CORE STRATEJİ FONKSİYONU ---
+def run_advanced_simulation(ticker, interval, test_days, cap):
+    # 1. VERİ ÇEKME
+    # Yfinance limitleri: 1h verisi max 730 gün geriye gider.
+    period = "2y" if interval == "1h" else "max"
     try:
-        df_raw = yf.download(ticker, start=start_date, progress=False)
-        # MultiIndex Fix
-        if isinstance(df_raw.columns, pd.MultiIndex): df_raw.columns = df_raw.columns.get_level_values(0)
-        df_raw.columns = [c.lower() for c in df_raw.columns]
-        if 'close' not in df_raw.columns and 'adj close' in df_raw.columns: df_raw['close'] = df_raw['adj close']
+        df = yf.download(ticker, period=period, interval=interval, progress=False)
+        # MultiIndex temizliği
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        df.columns = [c.lower() for c in df.columns]
         
-        if len(df_raw) < 200: return None
-    except: return None
-
-    timeframes = {'D': 'D', 'W': 'W', 'M': 'M'}
-    weights = [0.50, 0.70, 0.85, 0.90]
-    
-    best_roi = -9999
-    best_equity_curve = []
-    best_info = ""
-    
-    # Veriyi hazırlayalım (HODL için)
-    hodl_equity = (cap / df_raw['close'].iloc[0]) * df_raw['close']
-    
-    for tf_code in timeframes.values():
-        # Resample
-        if tf_code == 'D': df = df_raw.copy()
-        else:
-            agg = {'close': 'last', 'high': 'max', 'low': 'min'}
-            if 'open' in df_raw.columns: agg['open'] = 'first'
-            if 'volume' in df_raw.columns: agg['volume'] = 'sum'
-            df = df_raw.resample(tf_code).agg(agg).dropna()
-            
-        if len(df) < 50: continue
-        
-        # İndikatörler (YENİ FONKSİYON)
-        df['log_ret'] = np.log(df['close']/df['close'].shift(1))
-        df['range'] = (df['high'] - df['low'])/df['close']
-        df['custom_score'] = calculate_custom_score_magnitude(df)
+        # Eksik sütun tamamlama
+        if 'close' not in df.columns and 'adj close' in df.columns: df['close'] = df['adj close']
         df.dropna(inplace=True)
         
-        # HMM
-        X = df[['log_ret', 'range']].values
-        scaler = StandardScaler()
-        X_s = scaler.fit_transform(X)
-        try:
-            model = GaussianHMM(n_components=3, covariance_type="full", n_iter=100, random_state=42)
-            model.fit(X_s)
-            states = model.predict(X_s)
-            df['state'] = states
-        except: continue
-        
-        # Rejim Tespiti
-        means = df.groupby('state')['log_ret'].mean()
-        bull = means.idxmax()
-        bear = means.idxmin()
-        
-        for w_hmm in weights:
-            w_score = 1.0 - w_hmm
-            cash = cap
-            coin = 0
-            equity = []
-            dates = []
-            
-            for idx, row in df.iterrows():
-                p = row['close']
-                hm = 1 if row['state'] == bull else (-1 if row['state'] == bear else 0)
-                
-                # SKOR MANTIĞI: Artık skor -5.0 ile +5.0 arasında gelebilir (yüzdelerden dolayı)
-                # Kararı normalize etmiyoruz, güçlü bir % artış (örneğin skor +2.0) kararı domine etsin istiyoruz.
-                sc = row['custom_score'] 
-                
-                # Karar Formülü
-                decision = (w_hmm * hm) + (w_score * sc)
-                
-                # İşlem (Eşik değerleri biraz genişlettik çünkü skorlar artık değişken)
-                if decision > 0.30 and cash > 0: # AL
-                    coin = (cash * (1 - comm)) / p
-                    cash = 0
-                elif decision < -0.30 and coin > 0: # SAT
-                    cash = (coin * p) * (1 - comm)
-                    coin = 0
-                
-                val = cash + (coin * p)
-                equity.append(val)
-                dates.append(idx)
-            
-            if not equity: continue
-            final = equity[-1]
-            roi = (final - cap) / cap
-            
-            if roi > best_roi:
-                best_roi = roi
-                # Equity eğrisini orijinal tarih aralığına (Günlük) genişletmemiz lazım (Grafik için)
-                s_equity = pd.Series(equity, index=dates)
-                # Reindex to daily to match HODL curve
-                best_equity_curve = s_equity.reindex(df_raw.index, method='ffill').fillna(cap)
-                best_info = f"{tf_code} | %{int(w_hmm*100)} AI"
+        if len(df) < 200: return None
+    except: return None
 
-    return best_equity_curve, hodl_equity, best_info, best_roi
+    # 2. FEATURE ENGINEERING (Özellik Mühendisliği)
+    # Log Return (Getiri)
+    df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+    # Range (Volatilite temsili) -> HMM buna bayılır
+    df['range'] = (df['high'] - df['low']) / df['close']
+    # Teknik Skor
+    df['tech_score'] = calculate_technical_score(df)
+    
+    df.dropna(inplace=True)
 
-# --- 3. ÇALIŞTIRMA BUTONU ---
-if st.button("🚀 TÜM PORTFÖYÜ SİMÜLE ET", type="primary"):
-    if not selected_tickers:
-        st.error("Lütfen en az bir coin seçin.")
+    # 3. TRAIN / TEST SPLIT
+    split_date = df.index[-1] - timedelta(days=test_days)
+    train_data = df[df.index <= split_date].copy()
+    test_data = df[df.index > split_date].copy()
+    
+    if len(train_data) < 100 or len(test_data) < 10: return None
+
+    # 4. HMM MODEL EĞİTİMİ (Sadece Train Data Üzerinde)
+    # Özellikler: Getiri ve Volatilite (Range)
+    X_train = train_data[['log_ret', 'range']].values
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    
+    # Model: 3 Bileşenli (Ayı, Boğa, Yatay/Kararsız)
+    model = GaussianHMM(n_components=3, covariance_type="full", n_iter=100, random_state=42)
+    try:
+        model.fit(X_train_s)
+    except: return None
+    
+    # Rejimlerin Anlamlandırılması (Hangi State Boğa?)
+    means = model.means_[:, 0] # log_ret ortalamaları
+    bull_state = np.argmax(means)
+    bear_state = np.argmin(means)
+    
+    # 5. PREDICTION (Test Data Üzerinde)
+    # Test verisini, Train'in scaler'ı ile dönüştür
+    X_test = test_data[['log_ret', 'range']].values
+    X_test_s = scaler.transform(X_test)
+    hidden_states = model.predict(X_test_s)
+    test_data['state'] = hidden_states
+    
+    # 6. OPTİMİZASYON DÖNGÜSÜ (Self-Betterment)
+    # HMM (Yapay Zeka) ve Teknik Skor arasında en iyi ağırlığı bul.
+    # weights = [0.0 (Sadece Teknik), 0.5 (Eşit), 1.0 (Sadece AI)]
+    best_roi = -999
+    best_w_hmm = 0.5
+    best_equity = []
+    
+    possible_weights = np.arange(0.0, 1.1, 0.1) # 0.0, 0.1, ... 1.0
+    
+    # HODL Eğrisi (Kıyaslama için)
+    hodl_return = (test_data['close'].iloc[-1] - test_data['close'].iloc[0]) / test_data['close'].iloc[0]
+    
+    for w in possible_weights:
+        cash = cap
+        coin = 0
+        temp_equity = []
+        
+        for idx, row in test_data.iterrows():
+            # HMM Sinyali (+1, -1, 0)
+            hmm_sig = 1 if row['state'] == bull_state else (-1 if row['state'] == bear_state else 0)
+            
+            # Teknik Sinyal
+            tech_sig = row['tech_score']
+            
+            # Ağırlıklı Karar
+            decision = (w * hmm_sig) + ((1-w) * tech_sig)
+            
+            price = row['close']
+            
+            # İşlem (Basit threshold)
+            if decision > 0.2 and cash > 0: # AL
+                coin = cash / price
+                cash = 0
+            elif decision < -0.2 and coin > 0: # SAT
+                cash = coin * price
+                coin = 0
+            
+            val = cash + (coin * price)
+            temp_equity.append(val)
+        
+        final_val = temp_equity[-1]
+        roi = (final_val - cap) / cap
+        
+        if roi > best_roi:
+            best_roi = roi
+            best_w_hmm = w
+            best_equity = temp_equity
+
+    # 7. FORECASTING (GELECEK TAHMİNİ)
+    # Son durum (state) nedir?
+    last_state = hidden_states[-1]
+    # Geçiş Matrisinden bir sonraki adım olasılıklarını al
+    next_prob = model.transmat_[last_state]
+    # En yüksek olasılıklı bir sonraki durum
+    next_state = np.argmax(next_prob)
+    
+    # Yorumla
+    forecast_text = "YATAY/BELİRSİZ"
+    forecast_color = "gray"
+    prob_val = next_prob[next_state]
+    
+    if next_state == bull_state:
+        forecast_text = "YÜKSELİŞ (BULL)"
+        forecast_color = "green"
+    elif next_state == bear_state:
+        forecast_text = "DÜŞÜŞ (BEAR)"
+        forecast_color = "red"
+        
+    forecast_info = {
+        "current_state": "Boğa" if last_state == bull_state else ("Ayı" if last_state == bear_state else "Yatay"),
+        "next_prediction": forecast_text,
+        "confidence": prob_val,
+        "color": forecast_color
+    }
+
+    return {
+        "ticker": ticker,
+        "test_dates": test_data.index,
+        "equity_curve": best_equity,
+        "best_roi": best_roi,
+        "hodl_roi": hodl_return,
+        "best_weight": best_w_hmm,
+        "forecast": forecast_info
+    }
+
+# --- ARAYÜZ ---
+if st.button("🧪 Laboratuvarı Çalıştır (Train/Test + Forecast)"):
+    if not tickers:
+        st.error("Coin seçmelisin.")
     else:
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        cols = st.columns(len(tickers))
         
-        # Toplam Portföy Verileri
-        total_bot_equity = None
-        total_hodl_equity = None
-        
-        results_summary = []
-        
-        for i, t in enumerate(selected_tickers):
-            status_text.text(f"Analiz ediliyor: {t}...")
-            
-            bot_series, hodl_series, info, roi = run_strategy_for_coin(t, start_date, initial_capital_per_coin, commission)
-            
-            if bot_series is not None:
-                # Toplam Portföye Ekle
-                if total_bot_equity is None:
-                    total_bot_equity = bot_series
-                    total_hodl_equity = hodl_series
-                else:
-                    total_bot_equity = total_bot_equity.add(bot_series, fill_value=0)
-                    total_hodl_equity = total_hodl_equity.add(hodl_series, fill_value=0)
+        for i, ticker in enumerate(tickers):
+            with cols[i]:
+                st.markdown(f"### {ticker}")
+                with st.spinner("Modelleniyor..."):
+                    res = run_advanced_simulation(ticker, interval, test_window, capital)
                 
-                results_summary.append({
-                    "Coin": t,
-                    "Şampiyon Strateji": info,
-                    "Bot Kârı": f"%{roi*100:.1f}",
-                    "Son Bakiye": f"${bot_series.iloc[-1]:,.2f}"
-                })
-            
-            progress_bar.progress((i + 1) / len(selected_tickers))
-            
-        status_text.empty()
-        
-        if total_bot_equity is not None:
-            # --- SONUÇLAR ---
-            total_invested = initial_capital_per_coin * len(selected_tickers)
-            final_bot = total_bot_equity.iloc[-1]
-            final_hodl = total_hodl_equity.iloc[-1]
-            
-            bot_roi = ((final_bot - total_invested) / total_invested) * 100
-            hodl_roi = ((final_hodl - total_invested) / total_invested) * 100
-            
-            st.success("✅ Simülasyon Tamamlandı!")
-            
-            # 1. ÖZET METRİKLER
-            k1, k2, k3 = st.columns(3)
-            k1.metric("Bot Toplam Kasa", f"${final_bot:,.0f}", f"%{bot_roi:.1f}")
-            k2.metric("HODL Toplam Kasa", f"${final_hodl:,.0f}", f"%{hodl_roi:.1f}")
-            k3.metric("Bot Farkı (Alpha)", f"${final_bot - final_hodl:,.0f}", delta_color="normal")
-            
-            # 2. GRAFİK
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=total_bot_equity.index, y=total_bot_equity, name='BOT Portföyü', line=dict(color='#00ff00', width=2)))
-            fig.add_trace(go.Scatter(x=total_hodl_equity.index, y=total_hodl_equity, name='Sadece HODL', line=dict(color='gray', dash='dot')))
-            fig.update_layout(title="Toplam Fon Performansı (Kümülatif)", template="plotly_dark", height=600)
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # 3. DETAY TABLOSU
-            st.markdown("### 📊 Coin Bazlı Detaylar")
-            st.dataframe(pd.DataFrame(results_summary))
-            
-        else:
-            st.error("Veri alınamadı.")
-else:
-    st.info("Coinleri seçin ve 'Simüle Et' butonuna basın. Bot her coin için en iyi stratejiyi bulup toplam sonucu gösterecektir.")
+                if res:
+                    # METRİKLER
+                    bot_kar = res['best_roi'] * 100
+                    hodl_kar = res['hodl_roi'] * 100
+                    
+                    st.metric("Test ROI (Bot)", f"%{bot_kar:.2f}", delta=f"{bot_kar - hodl_kar:.2f}% vs HODL")
+                    st.caption(f"Optimum Yapı: %{int(res['best_weight']*100)} Yapay Zeka + %{int((1-res['best_weight'])*100)} Teknik Analiz")
+                    
+                    # FORECAST KUTUSU
+                    fc = res['forecast']
+                    st.markdown(f"""
+                    <div style="padding:10px; border-radius:5px; background-color:rgba(255,255,255,0.1); border:1px solid {fc['color']};">
+                        <strong>🔮 Gelecek Tahmini ({interval}):</strong><br>
+                        <span style="color:{fc['color']}; font-size:1.2em; font-weight:bold;">{fc['next_prediction']}</span><br>
+                        <small>Güven: %{fc['confidence']*100:.1f} | Şu an: {fc['current_state']}</small>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # GRAFİK
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=res['test_dates'], y=res['equity_curve'], mode='lines', name='Bot', line=dict(color='#00ff00')))
+                    # HODL çizgisini yaklaşık olarak çizelim (Sadece başlangıç ve bitiş noktası referansı)
+                    start_p = res['equity_curve'][0]
+                    end_p = start_p * (1 + res['hodl_roi'])
+                    fig.add_trace(go.Scatter(x=[res['test_dates'][0], res['test_dates'][-1]], y=[start_p, end_p], name='HODL (Ref)', line=dict(dash='dot', color='white')))
+                    
+                    fig.update_layout(
+                        title="Test Verisi Performansı",
+                        margin=dict(l=0, r=0, t=30, b=0),
+                        height=300,
+                        template="plotly_dark"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                else:
+                    st.error("Yetersiz veri veya model hatası.")
