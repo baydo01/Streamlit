@@ -2,8 +2,9 @@ streamlit
 yfinance
 pandas
 numpy
-matplotlib
-seaborn
 hmmlearn
 scikit-learn
-ccxt
+gspread
+oauth2client
+pytz
+plotly
